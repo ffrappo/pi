@@ -373,6 +373,13 @@ export class ExtensionRunner {
 	private hasPendingMessagesFn: () => boolean = () => false;
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	private compactFn: (options?: CompactOptions) => void = () => {};
+	private requestReloadFn: () => void = () => {
+		throw new Error("Deferred reload is not bound by this host");
+	};
+	private dispatchDepth = 0;
+	get isDispatching(): boolean {
+		return this.dispatchDepth > 0 || this.uiPromptDepth > 0;
+	}
 	private getSystemPromptFn: () => string = () => "";
 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () =>
 		normalizeBuildSystemPromptOptions({ cwd: this.cwd });
@@ -445,6 +452,11 @@ export class ExtensionRunner {
 		this.abortFn = contextActions.abort;
 		this.hasPendingMessagesFn = contextActions.hasPendingMessages;
 		this.shutdownHandler = contextActions.shutdown;
+		this.requestReloadFn =
+			contextActions.requestReload ??
+			(() => {
+				throw new Error("Deferred reload is not bound by this host");
+			});
 		this.getContextUsageFn = contextActions.getContextUsage;
 		this.compactFn = contextActions.compact;
 		this.getSystemPromptFn = contextActions.getSystemPrompt;
@@ -939,6 +951,10 @@ export class ExtensionRunner {
 				runner.assertActive();
 				runner.shutdownHandler();
 			},
+			requestReload: () => {
+				runner.assertActive();
+				runner.requestReloadFn();
+			},
 			getContextUsage: () => {
 				runner.assertActive();
 				return runner.getContextUsageFn();
@@ -1087,6 +1103,15 @@ export class ExtensionRunner {
 	}
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+		this.dispatchDepth++;
+		try {
+			return await this.emitDispatched(event);
+		} finally {
+			this.dispatchDepth--;
+		}
+	}
+
+	private async emitDispatched<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
 		const ctx = this.createContext();
 		let result: SessionBeforeEventResult | undefined;
 

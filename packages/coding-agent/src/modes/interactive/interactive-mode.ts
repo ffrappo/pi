@@ -1963,6 +1963,14 @@ export class InteractiveMode {
 	private async bindCurrentSessionExtensions(): Promise<void> {
 		const uiContext = this.createExtensionUIContext();
 		await this.session.bindExtensions({
+			reloadHandler: async () => {
+				await this.handleReloadCommand();
+			},
+			canReload: () =>
+				!this.shutdownRequested &&
+				!this.activeSelectorToken &&
+				!this.extensionSelector &&
+				this.compactionQueuedMessages.length === 0,
 			uiContext,
 			mode: "tui",
 			abortHandler: () => {
@@ -2254,6 +2262,7 @@ export class InteractiveMode {
 			shutdown: () => {
 				this.shutdownRequested = true;
 			},
+			requestReload: () => this.session.requestReload(),
 			getContextUsage: () => this.session.getContextUsage(),
 			compact: (options) => {
 				void (async () => {

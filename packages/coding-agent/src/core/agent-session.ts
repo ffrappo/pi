@@ -78,6 +78,7 @@ import {
 	shouldCompact,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
+import { DeferredReload } from "./deferred-reload.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
@@ -289,6 +290,10 @@ export interface ExtensionBindings {
 	abortHandler?: () => void;
 	shutdownHandler?: ShutdownHandler;
 	onError?: ExtensionErrorListener;
+	/** Mode-owned reload path, including UI/runtime rebind work. */
+	reloadHandler?: () => Promise<void>;
+	/** Mode-owned UI and queued-input gate for deferred reload. */
+	canReload?: () => boolean;
 }
 
 export type QueuedInputDisposition = "handled" | "queued";
@@ -441,6 +446,36 @@ export class AgentSession {
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
+	private _extensionReloadHandler?: () => Promise<void>;
+	private _modeCanReload: () => boolean = () => true;
+	private _extensionLifecycleDepth = 0;
+	private _reloadDepth = 0;
+	private _commandDepth = 0;
+	private readonly _deferredReload = new DeferredReload(
+		() =>
+			this.isIdle &&
+			!this._isEmittingAgentSettled &&
+			this._deferredSettledActions.length === 0 &&
+			this.pendingMessageCount === 0 &&
+			!this.agent.hasQueuedMessages() &&
+			this._bashAbortControllers.size === 0 &&
+			!this._retryAbortController &&
+			this._extensionLifecycleDepth === 0 &&
+			this._reloadDepth === 0 &&
+			this._commandDepth === 0 &&
+			!this._extensionRunner.isDispatching &&
+			this._modeCanReload(),
+		async () => {
+			if (this._extensionReloadHandler) await this._extensionReloadHandler();
+			else await this.reload();
+		},
+		(error) =>
+			this._extensionRunner.emitError({
+				extensionPath: "<runtime>",
+				event: "request_reload",
+				error: error instanceof Error ? error.message : String(error),
+			}),
+	);
 
 	private _modelRuntime: ModelRuntime;
 	private _cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
@@ -1361,6 +1396,7 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._deferredReload.dispose();
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -2078,6 +2114,7 @@ export class AgentSession {
 		// Get command context from extension runner (includes session control methods)
 		const ctx = this._extensionRunner.createCommandContext();
 
+		this._commandDepth++;
 		try {
 			await command.handler(args, ctx);
 			return true;
@@ -2089,6 +2126,8 @@ export class AgentSession {
 				error: err instanceof Error ? err.message : String(err),
 			});
 			return true;
+		} finally {
+			this._commandDepth--;
 		}
 	}
 
@@ -3209,6 +3248,17 @@ export class AgentSession {
 	}
 
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
+		this._extensionLifecycleDepth++;
+		try {
+			await this._bindExtensionsNow(bindings);
+		} finally {
+			this._extensionLifecycleDepth--;
+		}
+	}
+
+	private async _bindExtensionsNow(bindings: ExtensionBindings): Promise<void> {
+		if (bindings.reloadHandler !== undefined) this._extensionReloadHandler = bindings.reloadHandler;
+		if (bindings.canReload !== undefined) this._modeCanReload = bindings.canReload;
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
 		}
@@ -3403,6 +3453,7 @@ export class AgentSession {
 				shutdown: () => {
 					this._extensionShutdownHandler?.();
 				},
+				requestReload: () => this._deferredReload.request(),
 				getContextUsage: () => this.getContextUsage(),
 				compact: (options) => {
 					void (async () => {
@@ -3609,7 +3660,24 @@ export class AgentSession {
 		});
 	}
 
+	requestReload(): void {
+		this._deferredReload.request();
+	}
+
+	cancelRequestedReload(): void {
+		this._deferredReload.cancel();
+	}
+
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		this._reloadDepth++;
+		try {
+			await this._reloadNow(options);
+		} finally {
+			this._reloadDepth--;
+		}
+	}
+
+	private async _reloadNow(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });

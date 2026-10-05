@@ -211,6 +211,8 @@ The built-in MCP support connects registered servers. When nothing does, because
 `ExtensionContext` provides the working directory, mode, UI, session manager, model runtime, abort signal, context usage, and controls for compaction and shutdown.
 Use `ctx.modelRegistry.streamSimple()` for provider-neutral nested model calls.
 
+`ctx.requestReload()` is available in ordinary contexts. It returns immediately and coalesces requests into one reload after lifecycle dispatch, active work, compaction, queued input and UI prompts finish. It uses the current mode’s reload path, including TUI refresh and RPC resource rebinding. Session replacement or disposal cancels a pending request. Requests made during the reload itself are coalesced, not repeated. Failures are emitted as `request_reload` extension errors.
+
 Command handlers receive `ExtensionCommandContext`, which adds operations for waiting until idle, reloading, tree navigation, and session replacement.
 These operations are command-only because calling them from lifecycle handlers can deadlock the runtime.
 

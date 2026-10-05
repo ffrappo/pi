@@ -356,6 +356,9 @@ export interface ExtensionContext {
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown pi and exit. Available in all contexts. */
 	shutdown(): void;
+	/** Request one coalesced extension/resource reload at full idle. Returns
+	 * immediately; usable from lifecycle handlers without awaiting reload. */
+	requestReload(): void;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
 	/** Trigger compaction without awaiting completion. */
@@ -2173,6 +2176,7 @@ export interface ExtensionContextActions {
 	abort: () => void;
 	hasPendingMessages: () => boolean;
 	shutdown: () => void;
+	requestReload?: () => void;
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (options?: CompactOptions) => void;
 	getSystemPrompt: () => string;

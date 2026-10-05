@@ -317,6 +317,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;
 		await session.bindExtensions({
+			reloadHandler: async () => {
+				await session.reload();
+			},
+			canReload: () => !shutdownRequested,
 			uiContext: createExtensionUIContext(),
 			mode: "rpc",
 			commandContextActions: {
