@@ -2,6 +2,7 @@ import type { AutocompleteProvider, AutocompleteSuggestions } from "../autocompl
 import { getKeybindings } from "../keybindings.ts";
 import { decodePrintableKey, matchesKey } from "../keys.ts";
 import { KillRing } from "../kill-ring.ts";
+import type { StagedAttachment } from "../staged-attachment.ts";
 import {
 	type Component,
 	CURSOR_MARKER,
@@ -225,6 +226,7 @@ interface EditorState {
 interface EditorSnapshot {
 	state: EditorState;
 	pastes: Map<number, string>;
+	attachments: StagedAttachment[];
 	pasteCounter: number;
 }
 
@@ -366,6 +368,9 @@ export class Editor implements Component, Focusable {
 	// Undo support
 	private undoStack = new UndoStack<EditorSnapshot>();
 
+	private attachments: StagedAttachment[] = [];
+	public onAttachmentsChange?: () => void;
+	public onPaste?: (text: string) => void;
 	public onSubmit?: (text: string) => void;
 	public onChange?: (text: string) => void;
 	public disableSubmit: boolean = false;
@@ -388,6 +393,29 @@ export class Editor implements Component, Focusable {
 	/** Segment text with paste-marker awareness, only merging markers with valid IDs. */
 	private segment(text: string, mode: "word" | "grapheme"): Iterable<Intl.SegmentData> {
 		return segmentWithMarkers(text, mode === "word" ? wordSegmenter : graphemeSegmenter, this.validPasteIds());
+	}
+
+	getAttachments(): readonly StagedAttachment[] {
+		return this.attachments;
+	}
+	stageAttachment(attachment: StagedAttachment): void {
+		this.pushUndoSnapshot();
+		this.attachments = [...this.attachments.filter((item) => item.id !== attachment.id), attachment];
+		this.onAttachmentsChange?.();
+		this.tui.requestRender();
+	}
+	removeAttachment(id: string): void {
+		this.pushUndoSnapshot();
+		this.attachments = this.attachments.filter((item) => item.id !== id);
+		this.onAttachmentsChange?.();
+		this.tui.requestRender();
+	}
+	clearAttachments(): void {
+		if (!this.attachments.length) return;
+		this.pushUndoSnapshot();
+		this.attachments = [];
+		this.onAttachmentsChange?.();
+		this.tui.requestRender();
 	}
 
 	getPaddingX(): number {
@@ -626,6 +654,8 @@ export class Editor implements Component, Focusable {
 			}
 		}
 
+		for (const attachment of this.attachments)
+			result.push(sliceByColumn(this.borderColor(`▸ ${attachment.label} · ${attachment.intent}`), 0, width, true));
 		return result;
 	}
 
@@ -1257,6 +1287,9 @@ export class Editor implements Component, Focusable {
 	}
 
 	private handlePaste(pastedText: string): void {
+		// The host may offer an explicit attachment action for the whole paste event.
+		// Text remains text unless that action is confirmed.
+		this.onPaste?.(pastedText);
 		this.cancelAutocomplete();
 		this.exitHistoryBrowsing();
 		this.lastAction = null;
@@ -2113,7 +2146,12 @@ export class Editor implements Component, Focusable {
 	}
 
 	private pushUndoSnapshot(): void {
-		this.undoStack.push({ state: this.state, pastes: this.pastes, pasteCounter: this.pasteCounter });
+		this.undoStack.push({
+			state: this.state,
+			pastes: this.pastes,
+			pasteCounter: this.pasteCounter,
+			attachments: this.attachments,
+		});
 	}
 
 	private undo(): void {
@@ -2123,6 +2161,8 @@ export class Editor implements Component, Focusable {
 		Object.assign(this.state, snapshot.state);
 		this.pastes = snapshot.pastes;
 		this.pasteCounter = snapshot.pasteCounter;
+		this.attachments = snapshot.attachments;
+		this.onAttachmentsChange?.();
 		this.lastAction = null;
 		this.preferredVisualCol = null;
 		if (this.onChange) {

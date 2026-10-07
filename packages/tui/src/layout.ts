@@ -329,6 +329,10 @@ function paintScrollbar(box: LayoutBox, screen: string[], totalWidth: number): v
 
 function paintBox(box: LayoutBox, screen: string[], totalWidth: number): void {
 	if (box.lines) {
+		const start = Math.max(0, box.clip.y - box.rect.y);
+		const end = Math.min(box.rect.height, box.clip.y + box.clip.height - box.rect.y);
+		box.component.setViewport?.(start, end);
+		box.component.setVisible?.(box.clip.width > 0 && end > start);
 		const offset = box.lineOffset ?? 0;
 		const firstRow = Math.max(box.rect.y, box.clip.y, 0);
 		const lastRow = Math.min(box.rect.y + box.rect.height, box.clip.y + box.clip.height, screen.length);

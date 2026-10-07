@@ -35,6 +35,9 @@ export interface Keybindings {
 	"tui.input.tab": true;
 	"tui.input.copy": true;
 	// Generic selection actions
+	"tui.media.open": true;
+	"tui.media.inspect": true;
+	"tui.media.finish": true;
 	"tui.select.up": true;
 	"tui.select.down": true;
 	"tui.select.pageUp": true;
@@ -144,6 +147,9 @@ export const TUI_KEYBINDINGS = {
 	"tui.input.submit": { defaultKeys: "enter", description: "Submit input" },
 	"tui.input.tab": { defaultKeys: "tab", description: "Tab / autocomplete" },
 	"tui.input.copy": { defaultKeys: "ctrl+c", description: "Copy selection" },
+	"tui.media.open": { defaultKeys: "o", description: "Open original in media picker" },
+	"tui.media.inspect": { defaultKeys: "i", description: "Inspect selected media" },
+	"tui.media.finish": { defaultKeys: "f", description: "Finish media inspection" },
 	"tui.select.up": { defaultKeys: "up", description: "Move selection up" },
 	"tui.select.down": { defaultKeys: "down", description: "Move selection down" },
 	"tui.select.pageUp": { defaultKeys: "pageUp", description: "Selection page up" },

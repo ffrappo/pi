@@ -2,8 +2,6 @@ import {
 	Box,
 	type Component,
 	Container,
-	getCapabilities,
-	Image,
 	MouseRegion,
 	Spacer,
 	Text,
@@ -15,14 +13,17 @@ import type { ToolDefinition, ToolRenderContext, ToolRenderers } from "../../../
 /** What this component needs from a tool: how to draw it, without executing it. */
 export type { ToolRenderers };
 
+import type { AgentContent } from "@earendil-works/pi-agent-core";
+import type { MediaHandle } from "../../../core/media/types.ts";
 import { formatToolCallWithArgs, getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.ts";
-import { ensurePngTranscoder } from "../../../utils/image-convert.ts";
 import { theme } from "../theme/theme.ts";
 import { keyHint } from "./keybinding-hints.ts";
+import { MediaRow } from "./media-row.ts";
 
 const FALLBACK_PREVIEW_LINES = 10;
 
 export interface ToolExecutionOptions {
+	media?: MediaHandle;
 	showImages?: boolean;
 	imageWidthCells?: number;
 }
@@ -36,9 +37,8 @@ export class ToolExecutionComponent extends Container {
 	private callRendererComponent?: Component;
 	private resultRendererComponent?: Component;
 	private rendererState: any = {};
-	private imageComponents: Image[] = [];
-	/** Inputs of imageComponents, so updateDisplay can reuse images and keep their converted PNG data. */
-	private imageSources: Array<{ data: string; mimeType: string; widthCells: number }> = [];
+	private imageComponents: MediaRow[] = [];
+	private media?: MediaHandle;
 	private imageSpacers: Spacer[] = [];
 	private toolName: string;
 	private toolCallId: string;
@@ -53,7 +53,7 @@ export class ToolExecutionComponent extends Container {
 	private executionStarted = false;
 	private argsComplete = false;
 	private result?: {
-		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
+		content: AgentContent[];
 		isError: boolean;
 		details?: any;
 	};
@@ -73,6 +73,7 @@ export class ToolExecutionComponent extends Container {
 		this.toolCallId = toolCallId;
 		this.args = args;
 		this.toolDefinition = toolDefinition;
+		this.media = options.media;
 		this.showImages = options.showImages ?? true;
 		this.imageWidthCells = options.imageWidthCells ?? 60;
 		this.ui = ui;
@@ -180,7 +181,7 @@ export class ToolExecutionComponent extends Container {
 
 	updateResult(
 		result: {
-			content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
+			content: AgentContent[];
 			details?: any;
 			isError: boolean;
 		},
@@ -193,6 +194,7 @@ export class ToolExecutionComponent extends Container {
 
 	setExpanded(expanded: boolean): void {
 		this.expanded = expanded;
+		for (const row of this.imageComponents) row.setExpanded(expanded);
 		this.updateDisplay();
 	}
 
@@ -246,12 +248,56 @@ export class ToolExecutionComponent extends Container {
 
 	override handleMouse(event: TuiMouseEvent): ReturnType<Container["handleMouse"]> {
 		if (!this.hasRendererDefinition() || this.getRenderShell() !== "self") return super.handleMouse(event);
-		if (event.y <= 0 || event.y > this.selfRenderHeight) return undefined;
+		if (event.y > this.selfRenderHeight) {
+			let offset = this.selfRenderHeight + (this.selfRenderHeight ? 1 : 0);
+			for (const row of this.imageComponents) {
+				offset += 1;
+				const height = row.render(event.width).length;
+				if (event.y >= offset && event.y < offset + height) {
+					const result = row.handleMouse({ ...event, y: event.y - offset, height });
+					return result
+						? {
+								...result,
+								handled: true,
+								target: {
+									component: row,
+									originX: event.screenX - event.x,
+									originY: event.screenY - event.y + offset,
+									width: event.width,
+									height,
+								},
+							}
+						: undefined;
+				}
+				offset += height;
+			}
+			return undefined;
+		}
+		if (event.y <= 0) return undefined;
 		return this.selfRenderContainer.handleMouse({
 			...event,
 			y: event.y - 1,
 			height: this.selfRenderHeight,
 		});
+	}
+
+	/** Public shell/media boundary for decorators and picker, never private field mutation. */
+	getMediaRows(): readonly MediaRow[] {
+		return this.imageComponents;
+	}
+
+	override setViewport(start: number, end: number): void {
+		if (!this.hasRendererDefinition() || this.getRenderShell() !== "self") {
+			super.setViewport(start, end);
+			return;
+		}
+		let offset = this.selfRenderHeight + (this.selfRenderHeight ? 1 : 0);
+		for (const row of this.imageComponents) {
+			offset += 1;
+			const height = row.render(this.ui.terminal.columns).length;
+			row.setViewport(start - offset, end - offset);
+			offset += height;
+		}
 	}
 
 	private updateDisplay(): void {
@@ -322,52 +368,23 @@ export class ToolExecutionComponent extends Container {
 			hasContent = true;
 		}
 
-		const previousImages = this.imageComponents;
-		const previousSources = this.imageSources;
-		for (const img of this.imageComponents) {
-			this.removeChild(img);
-		}
-		this.imageComponents = [];
-		this.imageSources = [];
-		for (const spacer of this.imageSpacers) {
-			this.removeChild(spacer);
-		}
+		const previous = [...this.imageComponents];
+		for (const row of previous) this.removeChild(row);
+		for (const spacer of this.imageSpacers) this.removeChild(spacer);
 		this.imageSpacers = [];
-
-		if (this.result) {
-			const imageBlocks = this.result.content.filter((c) => c.type === "image");
-			const caps = getCapabilities();
-			for (const img of imageBlocks) {
-				if (caps.images && this.showImages && img.data && img.mimeType) {
-					const spacer = new Spacer(1);
-					this.addChild(spacer);
-					this.imageSpacers.push(spacer);
-					const source = { data: img.data, mimeType: img.mimeType, widthCells: this.imageWidthCells };
-					const index = this.imageComponents.length;
-					const previous = previousSources[index];
-					const imageComponent =
-						previous?.data === source.data &&
-						previous.mimeType === source.mimeType &&
-						previous.widthCells === source.widthCells
-							? previousImages[index]
-							: new Image(
-									source.data,
-									source.mimeType,
-									{ fallbackColor: (s: string) => theme.fg("toolOutput", s) },
-									{ maxWidthCells: source.widthCells },
-								);
-					if (source.mimeType !== "image/png") {
-						ensurePngTranscoder(() => {
-							this.invalidate();
-							this.ui.requestRender();
-						});
-					}
-					this.imageComponents.push(imageComponent);
-					this.imageSources.push(source);
-					this.addChild(imageComponent);
-				}
-			}
+		this.imageComponents = [];
+		for (const block of this.result?.content ?? []) {
+			if (block.type !== "image" && block.type !== "media_reference") continue;
+			const reused = previous.find((row) => row.source === block);
+			const row = reused ?? new MediaRow(block, { ui: this.ui, media: this.media, showImages: this.showImages });
+			row.setShowImages(this.showImages);
+			this.imageComponents.push(row);
+			const spacer = new Spacer(1);
+			this.imageSpacers.push(spacer);
+			this.addChild(spacer);
+			this.addChild(row);
 		}
+		for (const row of previous) if (!this.imageComponents.includes(row)) row.dispose();
 
 		if (this.hasRendererDefinition() && !hasContent && this.imageComponents.length === 0) {
 			this.hideComponent = true;

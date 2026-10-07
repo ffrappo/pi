@@ -1,3 +1,4 @@
+import { inspectImage } from "./image-admission.ts";
 import { convertImageBytesToPng } from "./image-convert.ts";
 import { formatDimensionNote, type ImageResizeOptions, resizeImage } from "./image-resize.ts";
 
@@ -49,6 +50,7 @@ function normalizeSupportedImageMimeType(mimeType: string): string | null {
 async function normalizeImage(bytes: Uint8Array, mimeType: string): Promise<NormalizedImage | null> {
 	const normalizedMimeType = normalizeSupportedImageMimeType(mimeType);
 	if (normalizedMimeType) {
+		inspectImage(bytes, normalizedMimeType);
 		return { bytes, mimeType: normalizedMimeType };
 	}
 

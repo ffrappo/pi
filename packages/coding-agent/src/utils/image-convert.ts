@@ -1,89 +1,44 @@
 import { getCapabilities, type ImageTranscoder, setImageTranscoder } from "@earendil-works/pi-tui";
-import { applyExifOrientation } from "./exif-orientation.ts";
-import { loadPhoton } from "./photon.ts";
-
-type Photon = NonNullable<Awaited<ReturnType<typeof loadPhoton>>>;
-
-function encodePng(photon: Photon, bytes: Uint8Array): Uint8Array | null {
-	try {
-		const rawImage = photon.PhotonImage.new_from_byteslice(bytes);
-		const image = applyExifOrientation(photon, rawImage, bytes);
-		if (image !== rawImage) rawImage.free();
-		try {
-			return new Uint8Array(image.get_bytes());
-		} finally {
-			image.free();
-		}
-	} catch {
-		// Conversion failed
-		return null;
-	}
-}
+import { decodeImageBase64 } from "./image-admission.ts";
+import { resizeImage } from "./image-resize.ts";
 
 export async function convertImageBytesToPng(bytes: Uint8Array): Promise<Uint8Array | null> {
-	const photon = await loadPhoton();
-	if (!photon) {
-		// Photon not available, can't convert
-		return null;
-	}
-	return encodePng(photon, bytes);
+	// Conversion uses the same bounded worker as resizing; no decoder on the UI thread.
+	let mimeType: string;
+	if (bytes[0] === 255 && bytes[1] === 216) mimeType = "image/jpeg";
+	else if (bytes[0] === 137 && bytes[1] === 80) mimeType = "image/png";
+	else if (String.fromCharCode(...bytes.subarray(0, 3)) === "GIF") mimeType = "image/gif";
+	else if (String.fromCharCode(...bytes.subarray(0, 4)) === "RIFF") mimeType = "image/webp";
+	else throw new Error("Unsupported image conversion format");
+	const result = await resizeImage(bytes, mimeType, { outputCodecs: ["png"], forceReencode: true });
+	return result ? Buffer.from(result.data, "base64") : null;
 }
-
-/**
- * Convert image to PNG format for terminal display.
- * Kitty graphics protocol requires PNG format (f=100).
- */
 export async function convertToPng(
 	base64Data: string,
 	mimeType: string,
+	signal?: AbortSignal,
 ): Promise<{ data: string; mimeType: string } | null> {
-	// Already PNG, no conversion needed
-	if (mimeType === "image/png") {
-		return { data: base64Data, mimeType };
-	}
-
-	const bytes = new Uint8Array(Buffer.from(base64Data, "base64"));
-	const pngBytes = await convertImageBytesToPng(bytes);
-	if (!pngBytes) {
-		return null;
-	}
-
-	return {
-		data: Buffer.from(pngBytes).toString("base64"),
-		mimeType: "image/png",
-	};
+	const result = await resizeImage(decodeImageBase64(base64Data), mimeType, {
+		maxWidth: 320,
+		maxHeight: 320,
+		maxBytes: 96 * 1024,
+		outputCodecs: ["png"],
+		forceReencode: true,
+		signal,
+	});
+	return result ? { data: result.data, mimeType: result.mimeType } : null;
 }
-
-/**
- * Load photon and return a synchronous PNG transcoder for pi-tui's Kitty image rendering.
- * Returns undefined if photon cannot be loaded.
- */
-export async function loadPngTranscoder(): Promise<ImageTranscoder | undefined> {
-	const photon = await loadPhoton();
-	if (!photon) return undefined;
-	return (base64Data) => {
-		const pngBytes = encodePng(photon, new Uint8Array(Buffer.from(base64Data, "base64")));
-		return pngBytes ? Buffer.from(pngBytes).toString("base64") : null;
-	};
+/** Public transcoder is async so legacy extension Image use cannot block render. */
+export async function loadPngTranscoder(): Promise<ImageTranscoder> {
+	return convertToPngData;
 }
-
-let pngTranscoderLoad: Promise<boolean> | undefined;
-let pngTranscoderRegistered = false;
-
-/**
- * On Kitty-protocol terminals, register photon as pi-tui's image transcoder so non-PNG images render.
- * Loads photon once. `onRegistered` runs after registration so callers can re-render images that
- * showed text fallbacks; it is not called if the transcoder was already registered or cannot load.
- */
+async function convertToPngData(data: string, mime: string, signal?: AbortSignal): Promise<string | null> {
+	return (await convertToPng(data, mime, signal))?.data ?? null;
+}
+let registered = false;
 export function ensurePngTranscoder(onRegistered: () => void): void {
-	if (pngTranscoderRegistered || getCapabilities().images !== "kitty") return;
-	pngTranscoderLoad ??= loadPngTranscoder().then((transcoder) => {
-		if (!transcoder) return false;
-		setImageTranscoder(transcoder);
-		pngTranscoderRegistered = true;
-		return true;
-	});
-	void pngTranscoderLoad.then((registered) => {
-		if (registered) onRegistered();
-	});
+	if (registered || getCapabilities().images !== "kitty") return;
+	setImageTranscoder(convertToPngData);
+	registered = true;
+	onRegistered();
 }

@@ -132,6 +132,12 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private maxLinesRendered = 0;
 	private previousViewportTop = 0;
 
+	override releaseImage(imageId: number): void {
+		this.previousKittyImageIds.delete(imageId);
+		this.previousLines = this.previousLines.map((line) => (extractKittyImageIds(line).includes(imageId) ? "" : line));
+		super.releaseImage(imageId);
+	}
+
 	captureRenderState(): TuiMainScreenRenderState {
 		return {
 			previousLines: [...this.previousLines],
@@ -262,6 +268,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 		// Render all components to get new lines
 		let newLines = this.render(width);
+		this.setViewport(Math.max(0, newLines.length - height), newLines.length);
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.hasOverlayEntries) {

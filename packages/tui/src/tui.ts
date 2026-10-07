@@ -12,7 +12,7 @@ import {
 	type TerminalColorScheme,
 	type TerminalColors,
 } from "./terminal-colors.ts";
-import { getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.ts";
+import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.ts";
 import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.ts";
 
 /**
@@ -138,6 +138,12 @@ export interface Component {
 	 * Invalidate any cached rendering state.
 	 * Called when theme changes or when component needs to re-render from scratch.
 	 */
+	/** Explicit owning component teardown, distinct from temporary unmount/reparenting. */
+	dispose?(): void;
+	/** Layout owner reports whether this component intersects the viewport. */
+	setVisible?(visible: boolean): void;
+	/** Visible line interval relative to this component after final layout. */
+	setViewport?(start: number, end: number): void;
 	invalidate(): void;
 }
 
@@ -363,6 +369,19 @@ export class Container implements Component {
 		this.children = [];
 	}
 
+	setViewport(start: number, end: number): void {
+		let offset = 0;
+		for (const child of this.mouseLayout?.children ?? []) {
+			child.component.setViewport?.(Math.max(0, start - offset), Math.min(child.height, end - offset));
+			child.component.setVisible?.(end > offset && start < offset + child.height);
+			offset += child.height;
+		}
+	}
+
+	dispose(): void {
+		for (const child of this.children) child.dispose?.();
+	}
+
 	invalidate(): void {
 		for (const child of this.children) {
 			child.invalidate?.();
@@ -467,6 +486,8 @@ export interface TUI extends Component {
 	showOverlay(component: Component, options?: OverlayOptions): OverlayHandle;
 	hideOverlay(): void;
 	hasOverlay(): boolean;
+	/** Release only a component-owned graphics upload. iTerm2 scrollback graphics remain terminal-owned. */
+	releaseImage(imageId: number): void;
 	start(): void;
 	stop(options?: TuiStopOptions): void;
 	renderNow(force?: boolean): void;
@@ -536,6 +557,13 @@ export abstract class TuiBase extends Container implements TUI {
 		if (showHardwareCursor !== undefined) {
 			this.showHardwareCursor = showHardwareCursor;
 		}
+	}
+
+	/** Called only for IDs issued by Image; subclasses also drop upload bookkeeping. */
+	releaseImage(imageId: number): void {
+		if (!Number.isInteger(imageId) || imageId <= 0) throw new Error("Invalid TUI image lease ID");
+		if (getCapabilities().images === "kitty" && !this.stopped) this.terminal.write(deleteKittyImage(imageId));
+		this.requestRender();
 	}
 
 	protected abstract doRender(): void;

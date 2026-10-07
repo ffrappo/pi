@@ -24,6 +24,7 @@ import {
 	deleteAllKittyPlacements,
 	deleteKittyImage,
 	getCapabilities,
+	getKittyImageMetadata,
 	getKittyImagePlacement,
 	getKittyImagePlacementRows,
 	type ImageProtocol,
@@ -417,6 +418,18 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			setCapabilities(this.savedCapabilities);
 			this.savedCapabilities = undefined;
 		}
+	}
+
+	override releaseImage(imageId: number): void {
+		this.uploadedKittyImages.delete(imageId);
+		this.previousScreen = this.previousScreen.map((line) =>
+			getKittyImageMetadata(line)?.imageId === imageId ? "" : line,
+		);
+		this.lastDocument = this.lastDocument.map((line) =>
+			getKittyImageMetadata(line)?.imageId === imageId ? "" : line,
+		);
+		this.currentLayout = undefined;
+		super.releaseImage(imageId);
 	}
 
 	private deleteKittyImages(): string {

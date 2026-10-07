@@ -7,13 +7,12 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentContent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AuthEvent, AuthPrompt } from "@earendil-works/pi-ai";
 import {
 	type AssistantMessage,
 	type ImageContent,
 	isRetryableAssistantError,
-	type Message,
 	type Model,
 	type Usage,
 } from "@earendil-works/pi-ai/compat";
@@ -96,6 +95,7 @@ import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
 import type { McpHttpServerConfig } from "../../core/mcp-servers.ts";
+import type { MediaCaptureInput, MediaReferenceContent } from "../../core/media/types.ts";
 import { createCompactionSummaryMessage, createCustomMessage } from "../../core/messages.ts";
 import {
 	defaultModelPerProvider,
@@ -133,6 +133,7 @@ import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { loadAllHighlightLanguages } from "../../utils/syntax-highlight.ts";
 import { ensureTool, type ToolStatus } from "../../utils/tools-manager.ts";
 import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-check.ts";
+import { AttachmentComposer } from "./attachment-composer.ts";
 import { reportBug } from "./bug-report.ts";
 import { createChatViewport } from "./chat-viewport.ts";
 import { ArminComponent } from "./components/armin.ts";
@@ -152,6 +153,8 @@ import { ExtensionSelectorComponent } from "./components/extension-selector.ts";
 import { FooterComponent, formatTokens } from "./components/footer.ts";
 import { formatKeyText, keyDisplayText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.ts";
 import { LoginDialogComponent } from "./components/login-dialog.ts";
+import { MediaPicker } from "./components/media-picker.ts";
+import { MediaRow } from "./components/media-row.ts";
 import { createMermaidMarkdownTransformer } from "./components/mermaid.ts";
 import { ModelSelectorComponent } from "./components/model-selector.ts";
 import {
@@ -263,7 +266,10 @@ class BuiltInHeader extends ExpandableText {
 	}
 }
 
+type ComposerInput = { text: string; media: MediaReferenceContent[] };
+
 type CompactionQueuedMessage = {
+	media?: MediaReferenceContent[];
 	text: string;
 	mode: "steer" | "followUp";
 };
@@ -435,6 +441,7 @@ export interface InteractiveModeOptions {
 	initialMessage?: string;
 	/** Images to attach to the initial message */
 	initialImages?: ImageContent[];
+	initialMedia?: MediaCaptureInput[];
 	/** Additional messages to send after the initial message */
 	initialMessages?: string[];
 	/** Force verbose startup (overrides quietStartup setting) */
@@ -475,8 +482,9 @@ export class InteractiveMode {
 	private keybindings: KeybindingsManager;
 	private version: string;
 	private isInitialized = false;
-	private onInputCallback?: (text: string) => void;
-	private pendingUserInputs: string[] = [];
+	private composer: AttachmentComposer;
+	private onInputCallback?: (input: ComposerInput) => void;
+	private pendingUserInputs: ComposerInput[] = [];
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
 	private activeWorkingIndicatorEmbedded = false;
 	private readonly idleStatus = new IdleStatus();
@@ -643,6 +651,7 @@ export class InteractiveMode {
 			autocompleteMaxVisible,
 			embedWorkingStatus: true,
 		});
+		this.composer = new AttachmentComposer(this.defaultEditor);
 		this.editor = this.defaultEditor;
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor as Component);
@@ -1183,6 +1192,7 @@ export class InteractiveMode {
 			modelFallbackMessage,
 			initialMessage,
 			initialImages,
+			initialMedia,
 			initialMessages,
 		} = this.options;
 
@@ -1222,7 +1232,9 @@ export class InteractiveMode {
 		// Process initial messages
 		if (initialMessage) {
 			try {
-				await this.session.prompt(initialMessage, { images: initialImages });
+				const media: MediaReferenceContent[] = [];
+				for (const input of initialMedia ?? []) media.push(await this.session.media.capture(input));
+				await this.session.prompt(initialMessage, { images: initialImages, media });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
@@ -1244,8 +1256,10 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				await this.session.prompt(userInput);
+				await this.session.prompt(userInput.text, { media: userInput.media });
 			} catch (error: unknown) {
+				this.composer.restore(userInput.media);
+				this.editor.setText(userInput.text);
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
 			}
@@ -2001,7 +2015,7 @@ export class InteractiveMode {
 						return { cancelled: true };
 					}
 
-					this.chatContainer.clear();
+					this.clearChat();
 					this.renderInitialMessages();
 					if (result.editorText && !this.editor.getText().trim()) {
 						this.editor.setText(result.editorText);
@@ -2200,7 +2214,7 @@ export class InteractiveMode {
 
 	private renderCurrentSessionState(): void {
 		this.loadedResourcesContainer.clear();
-		this.chatContainer.clear();
+		this.clearChat();
 		this.pendingMessagesContainer.clear();
 		this.compactionQueuedMessages = [];
 		this.streamingComponent = undefined;
@@ -3110,6 +3124,20 @@ export class InteractiveMode {
 
 		// Handle clipboard paste (triggered on Ctrl+V). Copied files use their original paths,
 		// images are attached via temporary files, and plain text is the final fallback.
+		this.defaultEditor.onPaste = (text) => {
+			if (this.isBashMode) return;
+			// A terminal cannot distinguish drop from pasted prose. Offer an action,
+			// never promote a path merely mentioned in the prompt.
+			const candidate = text.trim();
+			if (
+				path.isAbsolute(candidate) &&
+				!candidate.includes("\n") &&
+				[".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mov", ".webm"].includes(
+					path.extname(candidate).toLowerCase(),
+				)
+			)
+				this.showStatus("File paste: use /attach to stage the original");
+		};
 		this.defaultEditor.onPasteImage = () => {
 			void this.handleClipboardPaste();
 		};
@@ -3129,6 +3157,90 @@ export class InteractiveMode {
 		}
 	}
 
+	private async handleMediaCommand(command: string): Promise<void> {
+		try {
+			if (command === "/attach" || command.startsWith("/attach ")) {
+				let file = command.slice(7).trim();
+				if (!file) file = (await this.showExtensionInput("Attach", "Original file"))?.trim() ?? "";
+				if (!file) return;
+				if ((file.startsWith('"') && file.endsWith('"')) || (file.startsWith("'") && file.endsWith("'")))
+					file = file.slice(1, -1);
+				await this.composer.stage(
+					this.session.media,
+					{
+						source: "path",
+						path: path.resolve(this.sessionManager.getCwd(), file),
+						ingress: "composer",
+						intent: "view",
+					},
+					"file",
+				);
+				return;
+			}
+			const parts = command.trim().split(/\s+/);
+			const action = parts[1];
+			if (action === "clear") {
+				this.composer.clear();
+				return;
+			}
+			if (action === "staged") {
+				const item = this.defaultEditor.getAttachments()[Number(parts[2] ?? "1") - 1];
+				if (!item) throw new Error("Staged attachment not found");
+				if (parts[3] === "remove") this.defaultEditor.removeAttachment(item.id);
+				else this.defaultEditor.stageAttachment({ ...item, intent: parts[3] === "inspect" ? "inspect" : "view" });
+				return;
+			}
+			if (action) {
+				const id = parts[2];
+				const refs = [...this.session.media.list(), ...this.composer.selected()].filter(
+					(ref) => id && (ref.assetId === id || ref.assetId.slice(7).startsWith(id)),
+				);
+				if (refs.length !== 1) throw new Error("Select one exact media ID");
+				if (action === "open") await this.session.media.open(refs[0]);
+				else if (action === "inspect") await this.session.media.inspect(refs[0], { reason: "User /media inspect" });
+				else if (action === "finish" && refs[0].inspectionId)
+					await this.session.media.finish(refs[0].inspectionId, "User /media finish");
+				else
+					throw new Error(
+						"Use /media, /media open|inspect|finish <id>, /media staged <index> inspect|view|remove, or /attach <file>",
+					);
+				return;
+			}
+			const rows: MediaRow[] = [];
+			for (const child of this.chatContainer.children) {
+				if (child instanceof MediaRow) rows.push(child);
+				else if (child instanceof ToolExecutionComponent) rows.push(...child.getMediaRows());
+			}
+			const stagedRows = this.composer.selected().map(
+				(ref) =>
+					new MediaRow(ref, {
+						ui: this.ui,
+						media: this.session.media,
+						showImages: this.settingsManager.getShowImages(),
+					}),
+			);
+			rows.push(...stagedRows);
+			this.showSelector((done) => {
+				const picker = new MediaPicker(rows, this.ui, done);
+				for (const row of stagedRows) row.dispose();
+				return { component: picker, focus: picker, dispose: () => picker.dispose() };
+			});
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private async submitComposer(text: string, mode: "steer" | "followUp"): Promise<void> {
+		const media = this.composer.take();
+		try {
+			await this.session.prompt(text, { streamingBehavior: mode, media });
+		} catch (error) {
+			this.composer.restore(media);
+			this.editor.setText(text);
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
 	private async handleClipboardPaste(): Promise<void> {
 		try {
 			const filePaths = await readClipboardFilePaths();
@@ -3136,7 +3248,21 @@ export class InteractiveMode {
 				if (filePaths.some((filePath) => /\p{Cc}/u.test(filePath))) {
 					throw new Error("Clipboard file path contains control characters");
 				}
-				const paths = this.isBashMode ? filePaths.map(quoteIfNeeded).join(" ") : filePaths.join("\n");
+				if (!this.isBashMode) {
+					for (const file of filePaths) {
+						const extension = path.extname(file).toLowerCase();
+						if ([".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mov", ".webm"].includes(extension))
+							await this.composer.stage(
+								this.session.media,
+								{ source: "path", path: file, ingress: "clipboard-file", intent: "view" },
+								"clipboard",
+							);
+						else this.editor.insertTextAtCursor?.(`${file}\n`);
+					}
+					this.ui.requestRender();
+					return;
+				}
+				const paths = filePaths.map(quoteIfNeeded).join(" ");
 				const cursor = this.editor.getCursor?.();
 				const currentLine = cursor ? (this.editor.getText().split("\n")[cursor.line] ?? "") : "";
 				const characterBeforeCursor = cursor && cursor.col > 0 ? currentLine[cursor.col - 1] : "";
@@ -3150,6 +3276,20 @@ export class InteractiveMode {
 
 			const image = await readClipboardImage();
 			if (image) {
+				if (!this.isBashMode) {
+					await this.composer.stage(
+						this.session.media,
+						{
+							source: "bytes",
+							data: Buffer.from(image.bytes).toString("base64"),
+							mimeType: image.mimeType,
+							ingress: "clipboard-image",
+							intent: "view",
+						},
+						"clipboard",
+					);
+					return;
+				}
 				const tmpDir = os.tmpdir();
 				const ext = extensionForImageMimeType(image.mimeType) ?? "png";
 				const fileName = `pi-clipboard-${crypto.randomUUID()}.${ext}`;
@@ -3179,7 +3319,12 @@ export class InteractiveMode {
 	private setupEditorSubmitHandler(): void {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
-			if (!text) return;
+			if (!text && !this.defaultEditor.getAttachments().length) return;
+			if (text === "/media" || text.startsWith("/media ") || text === "/attach" || text.startsWith("/attach ")) {
+				this.editor.setText("");
+				await this.handleMediaCommand(text);
+				return;
+			}
 
 			// Handle commands
 			if (text === "/settings") {
@@ -3358,7 +3503,7 @@ export class InteractiveMode {
 			if (this.session.isStreaming) {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.session.prompt(text, { streamingBehavior: "steer" });
+				await this.submitComposer(text, "steer");
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				return;
@@ -3369,9 +3514,9 @@ export class InteractiveMode {
 			this.flushPendingBashComponents();
 
 			if (this.onInputCallback) {
-				this.onInputCallback(text);
+				this.onInputCallback({ text, media: this.composer.take() });
 			} else {
-				this.pendingUserInputs.push(text);
+				this.pendingUserInputs.push({ text, media: this.composer.take() });
 			}
 			this.editor.addToHistory?.(text);
 		};
@@ -3442,7 +3587,7 @@ export class InteractiveMode {
 				} else if (event.entry.type === "compaction") {
 					const entries = this.sessionManager.buildContextEntries();
 					if (entries[0]?.id !== event.entry.id) break;
-					this.chatContainer.clear();
+					this.clearChat();
 					const branch = this.sessionManager.getBranch();
 					const compactionIndex = branch.findIndex((entry) => entry.id === event.entry.id);
 					const entriesAfterCompaction = new Set(branch.slice(compactionIndex + 1).map((entry) => entry.id));
@@ -3513,6 +3658,7 @@ export class InteractiveMode {
 									content.id,
 									content.arguments,
 									{
+										media: this.session.media,
 										showImages: this.settingsManager.getShowImages(),
 										imageWidthCells: this.settingsManager.getImageWidthCells(),
 									},
@@ -3591,6 +3737,7 @@ export class InteractiveMode {
 						event.toolCallId,
 						event.args,
 						{
+							media: this.session.media,
 							showImages: this.settingsManager.getShowImages(),
 							imageWidthCells: this.settingsManager.getImageWidthCells(),
 						},
@@ -3680,7 +3827,7 @@ export class InteractiveMode {
 					if (entries[0]?.type !== "compaction") {
 						throw new Error("Completed compaction is missing from the session context");
 					}
-					this.chatContainer.clear();
+					this.clearChat();
 					// The latest compaction is prepended for model context; append it below at its chronological position.
 					this.renderSessionEntries(entries.slice(1));
 					this.addMessageToChat(
@@ -3769,7 +3916,7 @@ export class InteractiveMode {
 	}
 
 	/** Extract text content from a user message */
-	private getUserMessageText(message: Message): string {
+	private getUserMessageText(message: AgentMessage): string {
 		if (message.role !== "user") return "";
 		const textBlocks =
 			typeof message.content === "string"
@@ -3842,6 +3989,19 @@ export class InteractiveMode {
 		this.chatContainer.addChild(component);
 	}
 
+	private addMediaRows(content: readonly AgentContent[]): void {
+		for (const block of content) {
+			if (block.type === "image" || block.type === "media_reference")
+				this.chatContainer.addChild(
+					new MediaRow(block, {
+						ui: this.ui,
+						media: this.session.media,
+						showImages: this.settingsManager.getShowImages(),
+					}),
+				);
+		}
+	}
+
 	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
 		switch (message.role) {
 			case "bashExecution": {
@@ -3869,6 +4029,23 @@ export class InteractiveMode {
 					);
 					component.setExpanded(this.toolOutputExpanded);
 					this.chatContainer.addChild(component);
+					if (Array.isArray(message.content)) this.addMediaRows(message.content);
+					if (
+						message.customType === "cavallo_result" &&
+						(!Array.isArray(message.content) ||
+							!message.content.some((block) => block.type === "media_reference")) &&
+						message.details &&
+						typeof message.details === "object"
+					) {
+						const details = message.details as Record<string, unknown>;
+						if (typeof details.outputPath === "string" && path.isAbsolute(details.outputPath))
+							this.chatContainer.addChild(
+								new MediaRow(
+									{ type: "legacy_video", path: details.outputPath },
+									{ ui: this.ui, media: this.session.media, showImages: this.settingsManager.getShowImages() },
+								),
+							);
+					}
 				}
 				break;
 			}
@@ -3927,6 +4104,7 @@ export class InteractiveMode {
 						this.editor.addToHistory?.(textContent);
 					}
 				}
+				if (Array.isArray(message.content)) this.addMediaRows(message.content);
 				break;
 			}
 			case "assistant": {
@@ -3994,6 +4172,7 @@ export class InteractiveMode {
 							content.id,
 							content.arguments,
 							{
+								media: this.session.media,
 								showImages: this.settingsManager.getShowImages(),
 								imageWidthCells: this.settingsManager.getImageWidthCells(),
 							},
@@ -4203,22 +4382,27 @@ export class InteractiveMode {
 		);
 	}
 
-	async getUserInput(): Promise<string> {
+	async getUserInput(): Promise<ComposerInput> {
 		const queuedInput = this.pendingUserInputs.shift();
 		if (queuedInput !== undefined) {
 			return queuedInput;
 		}
 
 		return new Promise((resolve) => {
-			this.onInputCallback = (text: string) => {
+			this.onInputCallback = (input: ComposerInput) => {
 				this.onInputCallback = undefined;
-				resolve(text);
+				resolve(input);
 			};
 		});
 	}
 
-	private rebuildChatFromMessages(): void {
+	private clearChat(): void {
+		this.chatContainer.dispose();
 		this.chatContainer.clear();
+	}
+
+	private rebuildChatFromMessages(): void {
+		this.clearChat();
 		this.renderSessionEntries(this.sessionManager.buildContextEntries());
 	}
 
@@ -4434,7 +4618,7 @@ export class InteractiveMode {
 
 	private async handleFollowUp(): Promise<void> {
 		const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
-		if (!text) return;
+		if (!text && !this.defaultEditor.getAttachments().length) return;
 
 		// Queue input during compaction (extension commands execute immediately)
 		if (this.session.isCompacting) {
@@ -4453,7 +4637,7 @@ export class InteractiveMode {
 		if (this.session.isStreaming) {
 			this.editor.addToHistory?.(text);
 			this.editor.setText("");
-			await this.session.prompt(text, { streamingBehavior: "followUp" });
+			await this.submitComposer(text, "followUp");
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
 		}
@@ -4576,6 +4760,7 @@ export class InteractiveMode {
 	// =========================================================================
 
 	clearEditor(): void {
+		this.composer.clear();
 		this.editor.setText("");
 		this.ui.requestRender();
 	}
@@ -4666,7 +4851,8 @@ export class InteractiveMode {
 	 * Clears both session queue and compaction queue.
 	 */
 	private clearAllQueues(): { steering: string[]; followUp: string[] } {
-		const { steering, followUp } = this.session.clearQueue();
+		const { steering, followUp, media } = this.session.clearQueue();
+		this.composer.restore([...media, ...this.compactionQueuedMessages.flatMap((message) => message.media ?? [])]);
 		const compactionSteering = this.compactionQueuedMessages
 			.filter((msg) => msg.mode === "steer")
 			.map((msg) => msg.text);
@@ -4721,7 +4907,7 @@ export class InteractiveMode {
 	}
 
 	private queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
-		this.compactionQueuedMessages.push({ text, mode });
+		this.compactionQueuedMessages.push({ text, mode, media: this.composer.take() });
 		this.editor.addToHistory?.(text);
 		this.editor.setText("");
 		this.updatePendingMessagesDisplay();
@@ -4765,9 +4951,9 @@ export class InteractiveMode {
 					if (this.isExtensionCommand(message.text)) {
 						await this.session.prompt(message.text);
 					} else if (message.mode === "followUp") {
-						await this.session.followUp(message.text);
+						await this.session.followUp(message.text, undefined, { media: message.media });
 					} else {
-						await this.session.steer(message.text);
+						await this.session.steer(message.text, undefined, { media: message.media });
 					}
 				}
 				this.updatePendingMessagesDisplay();
@@ -4795,7 +4981,7 @@ export class InteractiveMode {
 
 			// Start a prompt when idle, or queue it into a run still finishing compaction.
 			const promptPromise = this.session
-				.prompt(firstPrompt.text, { streamingBehavior: firstPrompt.mode })
+				.prompt(firstPrompt.text, { streamingBehavior: firstPrompt.mode, media: firstPrompt.media })
 				.catch((error) => {
 					restoreQueue(error);
 				});
@@ -4805,9 +4991,9 @@ export class InteractiveMode {
 				if (this.isExtensionCommand(message.text)) {
 					await this.session.prompt(message.text);
 				} else if (message.mode === "followUp") {
-					await this.session.followUp(message.text);
+					await this.session.followUp(message.text, undefined, { media: message.media });
 				} else {
-					await this.session.steer(message.text);
+					await this.session.steer(message.text, undefined, { media: message.media });
 				}
 			}
 			this.updatePendingMessagesDisplay();
@@ -5631,7 +5817,7 @@ export class InteractiveMode {
 						}
 
 						// Update UI
-						this.chatContainer.clear();
+						this.clearChat();
 						this.renderInitialMessages();
 						if (result.editorText && !this.editor.getText().trim()) {
 							this.editor.setText(result.editorText);
@@ -7051,6 +7237,8 @@ export class InteractiveMode {
 	}
 
 	stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput()): void {
+		this.chatContainer.dispose();
+		this.composer.clear();
 		this.disposeActiveSelector();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
