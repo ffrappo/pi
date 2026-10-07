@@ -35,6 +35,8 @@ export interface MediaAsset {
 	canonicalPath: string;
 	name?: string;
 	availability?: "available" | "missing" | "unresolved";
+	metadataStatus?: "verified" | "unavailable";
+	metadataError?: string;
 	kind: "image" | "video";
 	width?: number;
 	height?: number;
@@ -136,6 +138,7 @@ export interface MediaHandle {
 	capture(input: MediaCaptureInput, signal?: AbortSignal): Promise<MediaReferenceContent>;
 	describe(ref: MediaReferenceContent, signal?: AbortSignal): Promise<MediaAsset>;
 	resolveOriginal(ref: MediaReferenceContent, signal?: AbortSignal): Promise<VerifiedMediaFile>;
+	readImage(ref: MediaReferenceContent, model: Model<Api>, signal?: AbortSignal): Promise<ImageContent>;
 	preview(ref: MediaReferenceContent, options?: MediaPreviewOptions): Promise<MediaPreviewLease>;
 	open(ref: MediaReferenceContent, signal?: AbortSignal): Promise<VerifiedMediaFile>;
 	list(): MediaReferenceContent[];
@@ -161,6 +164,8 @@ declare module "@earendil-works/pi-agent-core" {
 
 export function assertMediaReference(value: MediaReferenceContent): void {
 	if (
+		!value ||
+		value.type !== "media_reference" ||
 		value.schemaVersion !== 1 ||
 		!/^sha256:[a-f0-9]{64}$/.test(value.assetId) ||
 		!value.blockId ||

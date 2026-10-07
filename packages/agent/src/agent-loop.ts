@@ -890,7 +890,17 @@ async function finalizeExecutedToolCall(
 				isError = afterResult.isError ?? isError;
 			}
 		} catch (error) {
-			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
+			result = {
+				...result,
+				content: [
+					...result.content,
+					{
+						type: "text",
+						text: `Tool finalization failed: ${error instanceof Error ? error.message : String(error)}`,
+					},
+				],
+				isError: true,
+			};
 			isError = true;
 		}
 	}

@@ -339,6 +339,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					return transformed;
 				} catch (error) {
 					cacheWarmer.cancel();
+					await session.media.invalidate();
 					throw error;
 				}
 			},

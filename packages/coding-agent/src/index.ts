@@ -1,3 +1,4 @@
+export { exportMediaBundle, externalizeLegacySession } from "./core/media/portability.ts";
 export * from "./core/media/types.ts";
 export { prepareImagePreview } from "./utils/image-preview.ts";
 export type { ImageResizeOptions } from "./utils/image-resize.ts";

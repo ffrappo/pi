@@ -58,7 +58,6 @@ import {
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { sleep } from "../utils/sleep.ts";
-import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
@@ -114,6 +113,7 @@ import {
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { mediaReferences } from "./media/content.ts";
+import { MediaAdmissionError } from "./media/failures.ts";
 import { SessionMedia } from "./media/runtime.ts";
 import type { MediaReferenceContent, MediaService } from "./media/types.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
@@ -467,6 +467,8 @@ export class AgentSession {
 	private _toolRegistry: Map<string, AgentTool> = new Map();
 	/** Created on the first `ctx.executeTool()` call. */
 	private _nestedToolCalls: NestedToolCallRunner | undefined;
+	private _structuredCalls = new Set<string>();
+	private _structuredParents = new Set<string>();
 	/** Declared tools whose declarations requests leave out, from `prepareLoadout` hooks. */
 	private _hiddenDeclarations: ReadonlySet<string> = new Set();
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
@@ -707,6 +709,25 @@ export class AgentSession {
 		signal?: AbortSignal,
 	): Promise<AfterToolCallResult | undefined> {
 		const runner = this._extensionRunner;
+		let admittedContent: AgentContent[];
+		try {
+			admittedContent = await this.media.ingest(result.content ?? [], "tool", signal ?? this.agent.signal, {
+				toolCallId: toolCall.id,
+				parentToolCallId,
+			});
+		} catch (error) {
+			if (!(error instanceof MediaAdmissionError)) throw error;
+			return {
+				content: error.content.concat({
+					type: "text",
+					text: `Media capture failed: ${error instanceof Error ? error.message : String(error)}`,
+				}),
+				details: result.details,
+				structuredContent: result.structuredContent,
+				usage: result.usage,
+				isError: true,
+			};
+		}
 		const hookResult = runner.hasHandlers("tool_result")
 			? await runner.emitToolResult({
 					type: "tool_result",
@@ -714,7 +735,7 @@ export class AgentSession {
 					toolCallId: toolCall.id,
 					...(parentToolCallId ? { parentToolCallId } : {}),
 					input: args as Record<string, unknown>,
-					content: result.content,
+					content: admittedContent,
 					details: result.details,
 					...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
 					isError,
@@ -722,44 +743,29 @@ export class AgentSession {
 				})
 			: undefined;
 
-		let content = hookResult?.content ?? result.content ?? [];
+		let content = hookResult?.content ?? admittedContent;
 		try {
 			content = await this.media.ingest(content, "tool", signal ?? this.agent.signal, {
 				toolCallId: toolCall.id,
 				parentToolCallId,
 			});
 		} catch (error) {
-			this.media.failAdmission(error, content);
+			if (!(error instanceof MediaAdmissionError)) throw error;
 			return {
-				content: content
-					.filter((b) => b.type !== "image")
-					.concat({
-						type: "text",
-						text: `Media capture failed: ${error instanceof Error ? error.message : String(error)}`,
-					}),
+				content: error.content.concat({
+					type: "text",
+					text: `Media capture failed: ${error instanceof Error ? error.message : String(error)}`,
+				}),
 				details: result.details,
 				structuredContent: result.structuredContent,
 				usage: result.usage,
 				isError: true,
 			};
 		}
-		// Runs after the extension hook so images injected or replaced by extensions are normalized too.
-		const resizeOptions = this._limitsModel()?.inputLimits?.images?.resize;
-		const normalizedContent = await normalizeToolResultImages(
-			content.filter((b) => b.type !== "media_reference"),
-			{
-				autoResizeImages: this.settingsManager.getImageAutoResize(),
-				...(resizeOptions ? { resizeOptions } : {}),
-			},
-		);
-
-		if (!hookResult && normalizedContent === content) {
-			return undefined;
-		}
 
 		// The hook result already dropped structured content that replaced content no longer matches.
 		return {
-			content: [...normalizedContent, ...content.filter((b) => b.type === "media_reference")],
+			content,
 			details: hookResult?.details,
 			structuredContent: hookResult ? hookResult.structuredContent : result.structuredContent,
 			isError: hookResult?.isError ?? isError,
@@ -789,6 +795,7 @@ export class AgentSession {
 						isError: true,
 					});
 				}
+				if (this._structuredParents.has(parentId)) this._structuredCalls.add(toolCall.id);
 				return runToolCall(toolCall, {
 					tools: this._getCallableTools(),
 					assistantMessage,
@@ -804,7 +811,12 @@ export class AgentSession {
 				this._emit(event);
 			},
 		});
-		return this._nestedToolCalls.execute(parentToolCallId, name, args, options);
+		if (options.structuredOutput) this._structuredParents.add(parentToolCallId);
+		try {
+			return await this._nestedToolCalls.execute(parentToolCallId, name, args, options);
+		} finally {
+			this._structuredParents.delete(parentToolCallId);
+		}
 	}
 
 	/** Whether `projection`, the current session projection, exceeds the compaction threshold of `model`. */
@@ -1125,7 +1137,7 @@ export class AgentSession {
 
 	private async _emitAgentSettled(): Promise<void> {
 		this._cacheWarmer?.onAgentSettled();
-		await this.media.invalidate();
+		if (this.media.hasRequestLease) await this.media.invalidate();
 		this._isAgentRunActive = false;
 		this._isEmittingAgentSettled = true;
 		try {
@@ -2127,7 +2139,10 @@ export class AgentSession {
 				role: "custom",
 				customType: msg.customType,
 				// Untyped extensions can pass null/missing content; normalize at ingestion.
-				content: msg.content ?? [],
+				content:
+					typeof msg.content === "string"
+						? msg.content
+						: await this.media.ingest(msg.content ?? [], "before-agent-start"),
 				display: msg.display,
 				details: msg.details,
 				timestamp: Date.now(),
@@ -3473,6 +3488,7 @@ export class AgentSession {
 			},
 			{
 				getModel: () => this.model,
+				getStructuredOutput: (id) => this._structuredCalls.has(id),
 				getScopedModels: () => this._scopedModels,
 				isIdle: () => this.isIdle,
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),

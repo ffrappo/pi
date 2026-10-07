@@ -4,7 +4,9 @@ import type { AgentContent, AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { prepareImagePreview } from "../../utils/image-preview.ts";
 import type { SessionManager } from "../session-manager.ts";
+import { repairMediaAdmission, unresolvedMedia } from "./admission.ts";
 import { mediaReferences } from "./content.ts";
+import { failedMedia, MediaAdmissionError, retainFailedMedia } from "./failures.ts";
 import { MEDIA_POLICY_ENTRY, replayMediaPolicy } from "./policy.ts";
 import {
 	assertMediaReference,
@@ -21,13 +23,15 @@ import {
 
 export class SessionMedia implements MediaHandle {
 	readonly capabilities = MEDIA_CONTRACT;
+	get hasRequestLease(): boolean {
+		return this.leases.length > 0 || this.controller !== undefined;
+	}
 	private service?: MediaService;
 	private leases: InspectionLease[] = [];
 	private epoch = 0;
 	private controller?: AbortController;
 	private isStreaming: () => boolean;
-	private admissionError?: Error;
-	private failedContent: AgentContent[] = [];
+	private releasePending: Promise<void> = Promise.resolve();
 	private manager: SessionManager;
 	private invalidateRequest: () => void;
 	private refresh: () => void;
@@ -51,7 +55,7 @@ export class SessionMedia implements MediaHandle {
 			if (!active) return;
 			active = false;
 			if (this.service === service) {
-				this.invalidate();
+				this.releasePending = this.invalidate();
 				this.service = undefined;
 			}
 		};
@@ -80,6 +84,7 @@ export class SessionMedia implements MediaHandle {
 		await Promise.all(leases.map((l) => l.release()));
 	}
 	async dispose(): Promise<void> {
+		await this.releasePending;
 		await this.invalidate();
 		await this.service?.disposeSession(this.manager.getSessionId());
 		this.service = undefined;
@@ -96,6 +101,19 @@ export class SessionMedia implements MediaHandle {
 	async resolveOriginal(ref: MediaReferenceContent, signal?: AbortSignal) {
 		assertMediaReference(ref);
 		return this.owner().resolveOriginal(ref, this.context(signal));
+	}
+	async readImage(ref: MediaReferenceContent, model: Model<Api>, signal?: AbortSignal) {
+		const lease = await this.owner().prepareInspection(
+			{ reference: ref, model, consumer: "nested-vision", mode: "overview" },
+			this.context(signal),
+		);
+		try {
+			if (lease.images.length !== 1) throw new Error("Legacy read image expects one raster");
+			signal?.throwIfAborted();
+			return { ...lease.images[0] };
+		} finally {
+			await lease.release();
+		}
 	}
 	async preview(ref: MediaReferenceContent, options: MediaPreviewOptions = {}) {
 		const maxDimension = Math.min(options.maxDimension ?? 320, 320),
@@ -157,7 +175,7 @@ export class SessionMedia implements MediaHandle {
 		return file;
 	}
 	list() {
-		return mediaReferences(
+		const refs = mediaReferences(
 			this.manager.getBranch().flatMap((e) =>
 				e.type === "message"
 					? [e.message]
@@ -174,6 +192,9 @@ export class SessionMedia implements MediaHandle {
 						: [],
 			),
 		);
+		for (const policy of replayMediaPolicy(this.manager.getBranch()).values())
+			if (!refs.some((r) => r.blockId === policy.reference.blockId)) refs.push(policy.reference);
+		return refs;
 	}
 	async inspect(
 		ref: MediaReferenceContent,
@@ -186,6 +207,9 @@ export class SessionMedia implements MediaHandle {
 		} = {},
 	) {
 		assertMediaReference(ref);
+		if (options.mode === "crop" && !options.crop) throw new Error("Crop inspection requires original coordinates");
+		if (options.interval && (!(options.interval.end > options.interval.start) || options.interval.frames < 1))
+			throw new Error("Invalid video inspection interval");
 		await this.describe(ref);
 		await this.invalidate();
 		const inspected: MediaReferenceContent = {
@@ -238,40 +262,39 @@ export class SessionMedia implements MediaHandle {
 		const output: AgentContent[] = [];
 		for (const block of content) {
 			if (block.type === "image") {
-				const ref = await this.owner().capture(
-					{ source: "bytes", data: block.data, mimeType: block.mimeType, ingress, intent: "inspect" },
-					this.context(signal, extra),
-				);
-				assertMediaReference(ref);
-				output.push({ ...ref, inspectionId: ref.inspectionId ?? ref.blockId });
+				try {
+					const ref = await this.owner().capture(
+						{ source: "bytes", data: block.data, mimeType: block.mimeType, ingress, intent: "inspect" },
+						this.context(signal, extra),
+					);
+					assertMediaReference(ref);
+					output.push({ ...ref, inspectionId: ref.inspectionId ?? ref.blockId });
+				} catch (error) {
+					if (ingress !== "tool") throw error;
+					output.push(await retainFailedMedia(block, error, this.context(signal, extra)));
+				}
 			} else {
 				if (block.type === "media_reference") assertMediaReference(block);
 				output.push(block);
 			}
 		}
+		const failed = failedMedia([{ content: output }]);
+		if (failed.length) throw new MediaAdmissionError(failed.map((f) => f.reason).join("; "), output);
 		return output;
 	}
 	async retryAdmission(signal?: AbortSignal): Promise<void> {
-		for (const ref of this.list()) await this.resolveOriginal(ref, signal);
-		if (this.failedContent.length) {
-			const content = await this.ingest(this.failedContent, "admission-repair", signal);
-			this.manager.appendMessage({
-				role: "user",
-				content: [{ type: "text", text: "Recovered original media from failed tool capture." }, ...content],
-				timestamp: Date.now(),
-			});
-			this.failedContent = [];
-			this.refresh();
-		}
-		this.admissionError = undefined;
 		await this.invalidate();
-	}
-	failAdmission(error: unknown, content: AgentContent[] = []) {
-		this.admissionError = error instanceof Error ? error : new Error(String(error));
-		this.failedContent = content;
+		await repairMediaAdmission(this.manager, this.owner(), (signal, extra) => this.context(signal, extra), signal);
+		this.refresh();
 	}
 	async hydrate(messages: AgentMessage[], model: Model<Api>, signal?: AbortSignal): Promise<AgentMessage[]> {
-		if (this.admissionError) throw new Error(`Media admission stopped request: ${this.admissionError.message}`);
+		const unresolved = unresolvedMedia(this.manager);
+		if (unresolved.length)
+			throw new Error(
+				`Media admission stopped request: ${unresolved.map((f) => `${f.failureId}: ${f.reason}`).join("; ")}`,
+			);
+		await this.releasePending;
+		if (!mediaReferences(messages).some((r) => r.intent === "inspect") && !this.hasRequestLease) return messages;
 		await this.invalidate();
 		const epoch = this.epoch;
 		const controller = new AbortController();

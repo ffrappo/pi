@@ -358,6 +358,7 @@ import type { SessionMedia } from "../media/runtime.ts";
 export class ExtensionRunner {
 	private extensions: Extension[];
 	private runtime: ExtensionRuntime;
+	private getStructuredOutput?: (toolCallId: string) => boolean;
 	private uiContext: ExtensionUIContext;
 	private mode: ExtensionMode = "print";
 	private cwd: string;
@@ -410,8 +411,17 @@ export class ExtensionRunner {
 
 	bindMedia(media: SessionMedia): void {
 		this.runtime.media = media;
-		if (this.runtime.pendingMediaService) media.register(this.runtime.pendingMediaService);
-		this.runtime.registerMediaService = (service) => media.register(service);
+		if (this.runtime.pendingMediaService)
+			this.runtime.boundMediaUnregister = media.register(this.runtime.pendingMediaService);
+		this.runtime.registerMediaService = (service) => {
+			const unregister = media.register(service);
+			this.runtime.boundMediaUnregister = unregister;
+			this.runtime.pendingMediaService = service;
+			return () => {
+				unregister();
+				if (this.runtime.pendingMediaService === service) this.runtime.pendingMediaService = undefined;
+			};
+		};
 	}
 
 	bindCore(
@@ -445,6 +455,7 @@ export class ExtensionRunner {
 
 		// Context actions (required)
 		this.getModel = contextActions.getModel;
+		this.getStructuredOutput = contextActions.getStructuredOutput;
 		this.getScopedModels = contextActions.getScopedModels;
 		this.isIdleFn = contextActions.isIdle;
 		this.isProjectTrustedFn = contextActions.isProjectTrusted;
@@ -973,6 +984,12 @@ export class ExtensionRunner {
 		const runner = this;
 		// createContext() returns a fresh object, so adding properties does not affect other contexts.
 		return Object.defineProperties(this.createContext() as ExtensionToolContext, {
+			structuredOutput: {
+				get() {
+					runner.assertActive();
+					return runner.getStructuredOutput?.(toolCallId) ?? false;
+				},
+			},
 			tools: {
 				get() {
 					runner.assertActive();

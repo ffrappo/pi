@@ -26,17 +26,9 @@ export function admitMediaPayload(payload: unknown, model: Model<Api>): void {
 		}
 		const object = value as Record<string, unknown>;
 		if (
-			object.type === "base64" &&
-			typeof object.media_type === "string" &&
-			object.media_type.startsWith("image/") &&
-			typeof object.data === "string"
-		) {
-			count++;
-			bytes += object.data.length;
-		}
-		if (
-			typeof object.mimeType === "string" &&
-			object.mimeType.startsWith("image/") &&
+			(object.type === "base64" || typeof object.mimeType === "string") &&
+			typeof (object.media_type ?? object.mimeType) === "string" &&
+			String(object.media_type ?? object.mimeType).startsWith("image/") &&
 			typeof object.data === "string"
 		) {
 			count++;

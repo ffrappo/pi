@@ -177,7 +177,11 @@ export function createExtensionRuntime(): ExtensionRuntime {
 			return () => {
 				if (!active) return;
 				active = false;
-				if (runtime.pendingMediaService === service) runtime.pendingMediaService = undefined;
+				if (runtime.pendingMediaService === service) {
+					runtime.boundMediaUnregister?.();
+					runtime.boundMediaUnregister = undefined;
+					runtime.pendingMediaService = undefined;
+				}
 			};
 		},
 		sendMessage: notInitialized,
@@ -284,7 +288,9 @@ function createExtensionAPI(
 		mediaCapabilities: "pi.media.v1" as const,
 		registerMediaService(service: MediaService) {
 			assertActive();
-			return runtime.registerMediaService(service);
+			const unregister = runtime.registerMediaService(service);
+			if (state === "loading") loadingUnsubscribers.push(unregister);
+			return unregister;
 		},
 		// Registration methods - write to extension
 		on(event: string, handler: HandlerFn): () => void {

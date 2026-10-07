@@ -188,7 +188,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 				case "toolResult":
 					return {
 						...m,
-						content: projectMediaContent(m.content) as Exclude<ReturnType<typeof projectMediaContent>, string>,
+						content: projectMediaContent(m.content),
 					};
 				case "system":
 				case "assistant":

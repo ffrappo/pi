@@ -418,7 +418,7 @@ export async function executeCodemode(
 			const callStartedAt = performance.now();
 			// Only tools from ctx.tools are callable, so ctx is set here.
 			if (!ctx) throw new Error("Tool calls need a session");
-			const outcome = await ctx.executeTool(tool.name, args, { signal: callSignal });
+			const outcome = await ctx.executeTool(tool.name, args, { signal: callSignal, structuredOutput: true });
 			record.id = outcome.toolCall.id;
 			record.durationMs = performance.now() - callStartedAt;
 			if (outcome.isError) {

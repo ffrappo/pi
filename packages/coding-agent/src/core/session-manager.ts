@@ -33,8 +33,9 @@ import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
+import { failedMedia, MEDIA_ADMISSION_ENTRY } from "./media/failures.ts";
 import { activeMediaCheckpoint, checkpointMessages, maskClosedMedia, replayMediaPolicy } from "./media/policy.ts";
-import { type ActiveMediaCheckpoint, MEDIA_CONTRACT } from "./media/types.ts";
+import { type ActiveMediaCheckpoint, assertMediaReference, MEDIA_CONTRACT } from "./media/types.ts";
 import {
 	type CustomMessage,
 	createBranchSummaryMessage,
@@ -445,6 +446,22 @@ function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "
  * Plain custom entries are display/state entries and do not participate in context.
  */
 export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage[] {
+	if (entry.type === "custom" && entry.customType === "pi.media.policy.v1") {
+		const policy = entry.data as { action?: string; inspectionId?: string; reason?: string; observation?: string };
+		if (policy.action === "close")
+			return [
+				{
+					role: "user",
+					content: [
+						{
+							type: "text",
+							text: `Inspection ${policy.inspectionId} finished: ${policy.reason}${policy.observation ? `\nObservation: ${policy.observation}` : ""}`,
+						},
+					],
+					timestamp: Date.parse(entry.timestamp),
+				},
+			];
+	}
 	if (entry.type === "message") {
 		const message = entry.message;
 		// Session files are parsed without validation; old versions, forks, or
@@ -1129,6 +1146,13 @@ export class SessionManager {
 			this.fileEntries = this.fileEntries.concat(entries);
 		}
 
+		for (const entry of this.fileEntries) {
+			if (entry.type === "session") continue;
+			const messages = sessionEntryToContextMessages(entry);
+			for (const message of messages)
+				if ("content" in message && Array.isArray(message.content))
+					for (const block of message.content) if (block.type === "media_reference") assertMediaReference(block);
+		}
 		this._buildIndex();
 	}
 
@@ -1252,6 +1276,9 @@ export class SessionManager {
 			message,
 		};
 		this._appendEntry(entry);
+		const failures = failedMedia([message].filter((m) => "content" in m));
+		if (failures.length)
+			this.appendCustomEntry(MEDIA_ADMISSION_ENTRY, { schemaVersion: 1, targetId: entry.id, failures });
 		return entry.id;
 	}
 

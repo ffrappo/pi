@@ -368,6 +368,8 @@ export interface ExtensionContext {
 
 /** Options for {@link ExtensionToolContext.executeTool}. */
 export interface ExecuteToolOptions {
+	/** Explicit programmatic consumer requires the declared legacy structured result. */
+	structuredOutput?: boolean;
 	/** Defaults to the calling tool's signal. */
 	signal?: AbortSignal;
 	/** Receives partial results of the nested tool, in addition to `tool_execution_update` events. */
@@ -383,6 +385,7 @@ export interface ExecuteToolOptions {
  * created with `createBashTool()` and run in a plain `Agent` or called directly, gets no context.
  */
 export interface ExtensionToolContext extends ExtensionContext {
+	readonly structuredOutput?: boolean;
 	/** Tools {@link executeTool} can call. */
 	readonly tools: readonly AgentTool[];
 	/**
@@ -2115,6 +2118,7 @@ export type SetLabelHandler = (entryId: string, label: string | undefined) => vo
  */
 export interface ExtensionRuntimeState {
 	pendingMediaService?: MediaService;
+	boundMediaUnregister?: () => void;
 	media?: MediaHandle;
 	registerMediaService: (service: MediaService) => () => void;
 	flagValues: Map<string, boolean | string>;
@@ -2175,6 +2179,7 @@ export interface ExtensionActions {
  */
 export interface ExtensionContextActions {
 	getModel: () => Model<any> | undefined;
+	getStructuredOutput?: (toolCallId: string) => boolean;
 	getScopedModels: () => readonly ScopedModel[];
 	isIdle: () => boolean;
 	isProjectTrusted: () => boolean;

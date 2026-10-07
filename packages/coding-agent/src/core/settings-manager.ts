@@ -131,6 +131,8 @@ export type PackageSource =
 	  };
 
 export interface Settings {
+	/** Extension-owned media UI policy. Absence means enabled; custody remains available. */
+	fornace?: { media?: { enabled?: boolean } };
 	lastChangelogVersion?: string;
 	defaultProvider?: string;
 	defaultModel?: string;

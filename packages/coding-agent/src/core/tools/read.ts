@@ -6,7 +6,7 @@ import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { processImage } from "../../utils/image-process.ts";
 import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
-import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import type { ExtensionToolContext, ToolDefinition } from "../extensions/types.ts";
 import { resolveReadPathAsync } from "./path-utils.ts";
 import { readRenderers } from "./renderers/read.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -111,7 +111,7 @@ export function createReadToolDefinition(
 			{ path, offset, limit }: { path: string; offset?: number; limit?: number },
 			signal?: AbortSignal,
 			_onUpdate?,
-			ctx?: ExtensionContext,
+			ctx?: ExtensionToolContext,
 		) {
 			return new Promise<{
 				content: AgentContent[];
@@ -158,30 +158,34 @@ export function createReadToolDefinition(
 								ref,
 							];
 						} else if (mimeType) {
-							const reference = ctx?.media
-								? await ctx.media.capture(
-										{ source: "path", path: absolutePath, ingress: "read", intent: "inspect" },
+							if (ctx?.media) {
+								const ref = await ctx.media.capture(
+									{ source: "path", path: absolutePath, ingress: "read", intent: "inspect" },
+									signal,
+								);
+								const note = `Read image ${ref.assetId} [${mimeType}]`;
+								content = [{ type: "text", text: note }, ref];
+								if (ctx.structuredOutput) {
+									if (!ctx.model) throw new Error("Structured image read requires selected model");
+									const image = await ctx.media.readImage(ref, ctx.model, signal);
+									structuredContent = { ...image, note, mediaReference: ref };
+								}
+							} else {
+								const buffer = await ops.readFile(absolutePath);
+								if (buffer.length > 32 * 1024 * 1024)
+									throw new Error("Legacy image read exceeds encoded byte admission");
+								const processed = await processImage(buffer, mimeType, {
+									autoResizeImages,
+									resizeOptions: {
+										...(ctx?.model?.inputLimits?.images?.resize ?? fallbackResizeOptions),
 										signal,
-									)
-								: undefined;
-							// Read image as binary.
-							const buffer = await ops.readFile(absolutePath);
-							const processed = await processImage(buffer, mimeType, {
-								autoResizeImages,
-								resizeOptions: ctx?.model?.inputLimits?.images?.resize ?? fallbackResizeOptions,
-							});
-							if (!processed.ok) throw new Error(`Image read failed: ${processed.message}`);
-							{
-								let textNote = `Read image file [${processed.mimeType}]`;
-								if (processed.hints.length > 0) textNote += `\n${processed.hints.join("\n")}`;
-								if (nonVisionImageNote) textNote += `\n${nonVisionImageNote}`;
+									},
+								});
+								if (!processed.ok) throw new Error(processed.message);
+								const note = `Read image [${processed.mimeType}]${nonVisionImageNote ?? ""}`;
 								const image = { type: "image" as const, data: processed.data, mimeType: processed.mimeType };
-								structuredContent = {
-									...image,
-									note: textNote,
-									...(reference ? { mediaReference: reference } : {}),
-								};
-								content = [{ type: "text", text: textNote }, reference ?? image];
+								structuredContent = { ...image, note };
+								content = [{ type: "text", text: note }, image];
 							}
 						} else {
 							// Read text content.
