@@ -99,7 +99,7 @@ export class MediaRow implements Component {
 		this.setVisible(end > 0 && start < this.renderHeight());
 	}
 	private renderHeight(): number {
-		return 1 + (this.expanded ? 2 + (this.image?.render(36).length ?? 0) + (this.error ? 1 : 0) : 0);
+		return this.render(this.options.ui.terminal.columns).length;
 	}
 	setShowImages(show: boolean): void {
 		this.options.showImages = show;
@@ -273,7 +273,15 @@ export class MediaRow implements Component {
 			this.image
 		)
 			lines.push(truncateToWidth(theme.fg("dim", "Poster"), width));
-		if (this.image) lines.push(...this.image.render(width));
+		if (this.image) {
+			try {
+				lines.push(...this.image.render(width));
+			} catch (error) {
+				this.release();
+				this.error = error instanceof Error ? error.message : String(error);
+				lines.push(truncateToWidth(theme.fg("error", this.error), width));
+			}
+		}
 		return lines;
 	}
 	dispose(): void {

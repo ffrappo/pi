@@ -1230,11 +1230,11 @@ export class InteractiveMode {
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
 
 		// Process initial messages
-		if (initialMessage) {
+		if (initialMessage || initialMedia?.length) {
 			try {
 				const media: MediaReferenceContent[] = [];
 				for (const input of initialMedia ?? []) media.push(await this.session.media.capture(input));
-				await this.session.prompt(initialMessage, { images: initialImages, media });
+				await this.session.prompt(initialMessage ?? "", { images: initialImages, media });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
