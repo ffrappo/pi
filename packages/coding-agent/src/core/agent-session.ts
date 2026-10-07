@@ -19,6 +19,7 @@ import {
 	type AfterToolCallContext,
 	type AfterToolCallResult,
 	type Agent,
+	type AgentContent,
 	type AgentContext,
 	type AgentEvent,
 	type AgentMessage,
@@ -30,6 +31,7 @@ import {
 	type PrepareNextTurnContext,
 	runToolCall,
 	type ThinkingLevel,
+	type AgentToolResultMessage as ToolResultMessage,
 } from "@earendil-works/pi-agent-core";
 import { contentText, getCurrentSystemMessage, retryDelayMs } from "@earendil-works/pi-ai";
 import type {
@@ -39,8 +41,6 @@ import type {
 	Model,
 	ProviderHeaders,
 	SystemMessage,
-	TextContent,
-	ToolResultMessage,
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import {
@@ -57,7 +57,6 @@ import {
 } from "@earendil-works/pi-ai/compat";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
-import { processImage } from "../utils/image-process.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
@@ -114,6 +113,9 @@ import {
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
+import { mediaReferences } from "./media/content.ts";
+import { SessionMedia } from "./media/runtime.ts";
+import type { MediaReferenceContent, MediaService } from "./media/types.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
@@ -245,6 +247,7 @@ function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<str
 }
 
 export interface AgentSessionConfig {
+	mediaService?: MediaService;
 	agent: Agent;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
@@ -306,6 +309,7 @@ export interface PromptOptions {
 	expandPromptTemplates?: boolean;
 	/** Image attachments */
 	images?: ImageContent[];
+	media?: MediaReferenceContent[];
 	/** When streaming, how to queue the message: "steer" (interrupt) or "followUp" (wait). Required if streaming. */
 	streamingBehavior?: "steer" | "followUp";
 	/** Source of input for extension input event handlers. Defaults to "interactive". */
@@ -367,6 +371,8 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 
 export class AgentSession {
 	readonly agent: Agent;
+	readonly media: SessionMedia;
+	private _requestMediaModel?: Model<any>;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
 
@@ -481,6 +487,15 @@ export class AgentSession {
 		this._cwd = config.cwd;
 		this._modelRuntime = config.modelRuntime;
 		this._cacheWarmer = config.cacheWarmer;
+		this.media = new SessionMedia(
+			this.sessionManager,
+			() => this._cacheWarmer?.cancel(),
+			() => {
+				this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
+			},
+			() => this.isStreaming,
+		);
+		if (config.mediaService) this.media.register(config.mediaService);
 		if (this._cacheWarmer) {
 			this._cacheWarmer.onWarmed = (entry) => this._emit({ type: "entry_appended", entry });
 		}
@@ -505,6 +520,23 @@ export class AgentSession {
 		this._installAgentBoundaryHooks();
 		this._installHiddenDeclarationsProjection();
 		this._installAgentForcedPromptProjection();
+		const previousTransform = this.agent.transformContext;
+		this.agent.transformContext = async (messages, signal) => {
+			const transformed = previousTransform ? await previousTransform(messages, signal) : messages;
+			const model = this._requestMediaModel ?? this.model;
+			if (!model) throw new Error("Media request requires a physical model");
+			if (
+				this.settingsManager.getBlockImages() &&
+				transformed.some(
+					(m) =>
+						"content" in m &&
+						Array.isArray(m.content) &&
+						m.content.some((b) => b.type === "media_reference" && b.intent === "inspect"),
+				)
+			)
+				throw new Error("Explicit media inspection is disabled by blockImages");
+			return this.media.hydrate(transformed, model, signal);
+		};
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -639,7 +671,7 @@ export class AgentSession {
 	 */
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = (context) => this._beforeToolCall(context);
-		this.agent.afterToolCall = (context) => this._afterToolCall(context);
+		this.agent.afterToolCall = (context, signal) => this._afterToolCall(context, undefined, signal);
 	}
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
@@ -672,6 +704,7 @@ export class AgentSession {
 	private async _afterToolCall(
 		{ toolCall, args, result, isError }: AfterToolCallContext,
 		parentToolCallId?: string,
+		signal?: AbortSignal,
 	): Promise<AfterToolCallResult | undefined> {
 		const runner = this._extensionRunner;
 		const hookResult = runner.hasHandlers("tool_result")
@@ -689,13 +722,36 @@ export class AgentSession {
 				})
 			: undefined;
 
-		const content = hookResult?.content ?? result.content ?? [];
+		let content = hookResult?.content ?? result.content ?? [];
+		try {
+			content = await this.media.ingest(content, "tool", signal ?? this.agent.signal, {
+				toolCallId: toolCall.id,
+				parentToolCallId,
+			});
+		} catch (error) {
+			this.media.failAdmission(error, content);
+			return {
+				content: content
+					.filter((b) => b.type !== "image")
+					.concat({
+						type: "text",
+						text: `Media capture failed: ${error instanceof Error ? error.message : String(error)}`,
+					}),
+				details: result.details,
+				structuredContent: result.structuredContent,
+				usage: result.usage,
+				isError: true,
+			};
+		}
 		// Runs after the extension hook so images injected or replaced by extensions are normalized too.
 		const resizeOptions = this._limitsModel()?.inputLimits?.images?.resize;
-		const normalizedContent = await normalizeToolResultImages(content, {
-			autoResizeImages: this.settingsManager.getImageAutoResize(),
-			...(resizeOptions ? { resizeOptions } : {}),
-		});
+		const normalizedContent = await normalizeToolResultImages(
+			content.filter((b) => b.type !== "media_reference"),
+			{
+				autoResizeImages: this.settingsManager.getImageAutoResize(),
+				...(resizeOptions ? { resizeOptions } : {}),
+			},
+		);
 
 		if (!hookResult && normalizedContent === content) {
 			return undefined;
@@ -703,7 +759,7 @@ export class AgentSession {
 
 		// The hook result already dropped structured content that replaced content no longer matches.
 		return {
-			content: normalizedContent,
+			content: [...normalizedContent, ...content.filter((b) => b.type === "media_reference")],
 			details: hookResult?.details,
 			structuredContent: hookResult ? hookResult.structuredContent : result.structuredContent,
 			isError: hookResult?.isError ?? isError,
@@ -738,7 +794,7 @@ export class AgentSession {
 					assistantMessage,
 					context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
 					beforeToolCall: (context) => this._beforeToolCall(context, parentId),
-					afterToolCall: (context) => this._afterToolCall(context, parentId),
+					afterToolCall: (context, signal) => this._afterToolCall(context, parentId, signal),
 					signal,
 					onUpdate,
 				});
@@ -799,7 +855,10 @@ export class AgentSession {
 			let { previous, context, projection } = await prepare();
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
-			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
+			if (!isVirtualModel(model)) {
+				this._requestMediaModel = model;
+				return { ...previous, context, model, thinkingLevel };
+			}
 
 			// The selection stays in agent state; only this request uses the routed model. A routing
 			// failure rejects, which ends the run with an error response. Only messages the user wrote
@@ -827,6 +886,7 @@ export class AgentSession {
 				await this._runAutoCompaction("threshold", false);
 				({ previous, context } = await prepare());
 			}
+			this._requestMediaModel = route.model;
 			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
 		};
 	}
@@ -1065,6 +1125,7 @@ export class AgentSession {
 
 	private async _emitAgentSettled(): Promise<void> {
 		this._cacheWarmer?.onAgentSettled();
+		await this.media.invalidate();
 		this._isAgentRunActive = false;
 		this._isEmittingAgentSettled = true;
 		try {
@@ -1105,7 +1166,12 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
-			const messageText = contentText(event.message.content, "");
+			const messageText = contentText(
+				typeof event.message.content === "string"
+					? event.message.content
+					: event.message.content.filter((b) => b.type === "text"),
+				"",
+			);
 			if (messageText) {
 				// Check steering queue first
 				const steeringIndex = this._steeringMessages.indexOf(messageText);
@@ -1920,28 +1986,6 @@ export class AgentSession {
 		return { text, images };
 	}
 
-	private async _normalizePromptImages(
-		images: ImageContent[] | undefined,
-	): Promise<{ images: ImageContent[]; hints: string[] }> {
-		if (!images) return { images: [], hints: [] };
-
-		const normalizedImages: ImageContent[] = [];
-		const hints: string[] = [];
-		for (const image of images) {
-			const processed = await processImage(Buffer.from(image.data, "base64"), image.mimeType, {
-				autoResizeImages: this.settingsManager.getImageAutoResize(),
-				resizeOptions: this._limitsModel()?.inputLimits?.images?.resize,
-			});
-			if (!processed.ok) {
-				hints.push(processed.message);
-				continue;
-			}
-			normalizedImages.push({ type: "image", data: processed.data, mimeType: processed.mimeType });
-			hints.push(...processed.hints);
-		}
-		return { images: normalizedImages, hints };
-	}
-
 	/**
 	 * Send a prompt to the agent.
 	 * - Handles extension commands (registered via pi.registerCommand) immediately, even during streaming
@@ -2003,9 +2047,9 @@ export class AgentSession {
 				);
 			}
 			if (options.streamingBehavior === "followUp") {
-				await this._queueFollowUp(expandedText, currentImages);
+				await this._queueFollowUp(expandedText, currentImages, options?.media);
 			} else {
-				await this._queueSteer(expandedText, currentImages);
+				await this._queueSteer(expandedText, currentImages, options?.media);
 			}
 			preflightResult?.("queued");
 			return;
@@ -2058,12 +2102,13 @@ export class AgentSession {
 			result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
 		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
 
-		const normalized = await this._normalizePromptImages(currentImages);
+		const captured = await this.media.ingest([...(currentImages ?? []), ...(options?.media ?? [])], "input");
+		const normalized = { images: captured, hints: [] as string[] };
 		const userText = normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
 
 		// Build messages only after hooks and image normalization have completed.
 		const messages: AgentMessage[] = [];
-		const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: userText }];
+		const userContent: AgentContent[] = [{ type: "text", text: userText }];
 		userContent.push(...normalized.images);
 		messages.push({
 			role: "user",
@@ -2161,6 +2206,7 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
 		source: InputSource,
+		media?: MediaReferenceContent[],
 	): Promise<QueuedInputDisposition> {
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -2178,9 +2224,9 @@ export class AgentSession {
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		if (behavior === "steer") {
-			await this._queueSteer(expandedText, processedInput.images);
+			await this._queueSteer(expandedText, processedInput.images, media);
 		} else {
-			await this._queueFollowUp(expandedText, processedInput.images);
+			await this._queueFollowUp(expandedText, processedInput.images, media);
 		}
 		return "queued";
 	}
@@ -2197,9 +2243,9 @@ export class AgentSession {
 	async steer(
 		text: string,
 		images?: ImageContent[],
-		options?: { source?: InputSource },
+		options?: { source?: InputSource; media?: MediaReferenceContent[] },
 	): Promise<QueuedInputDisposition> {
-		return this._queueUserInput(text, images, "steer", options?.source ?? "interactive");
+		return this._queueUserInput(text, images, "steer", options?.source ?? "interactive", options?.media);
 	}
 
 	/**
@@ -2213,21 +2259,18 @@ export class AgentSession {
 	async followUp(
 		text: string,
 		images?: ImageContent[],
-		options?: { source?: InputSource },
+		options?: { source?: InputSource; media?: MediaReferenceContent[] },
 	): Promise<QueuedInputDisposition> {
-		return this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
+		return this._queueUserInput(text, images, "followUp", options?.source ?? "interactive", options?.media);
 	}
 
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueSteer(text: string, images?: ImageContent[], media?: MediaReferenceContent[]): Promise<void> {
+		const content = await this.media.ingest([{ type: "text", text }, ...(images ?? []), ...(media ?? [])], "steer");
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
-		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
-		if (images) {
-			content.push(...images);
-		}
 		this.agent.steer({
 			role: "user",
 			content,
@@ -2238,13 +2281,13 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueFollowUp(text: string, images?: ImageContent[], media?: MediaReferenceContent[]): Promise<void> {
+		const content = await this.media.ingest(
+			[{ type: "text", text }, ...(images ?? []), ...(media ?? [])],
+			"followUp",
+		);
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
-		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
-		if (images) {
-			content.push(...images);
-		}
 		this.agent.followUp({ role: "user", content, timestamp: Date.now() });
 	}
 
@@ -2284,7 +2327,10 @@ export class AgentSession {
 			role: "custom" as const,
 			customType: message.customType,
 			// Untyped extensions can pass null/missing content; normalize at ingestion.
-			content: message.content ?? [],
+			content:
+				typeof message.content === "string"
+					? message.content
+					: await this.media.ingest(message.content ?? [], "custom"),
 			display: message.display,
 			details: message.details,
 			timestamp: Date.now(),
@@ -2349,12 +2395,13 @@ export class AgentSession {
 	 * @param options.expandPromptTemplates Whether to dispatch extension commands and expand skill commands and prompt templates. Default: false.
 	 */
 	async sendUserMessage(
-		content: string | (TextContent | ImageContent)[],
+		content: string | AgentContent[],
 		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 	): Promise<void> {
 		// Normalize content to text string + optional images
 		let text: string;
 		let images: ImageContent[] | undefined;
+		const media: MediaReferenceContent[] = [];
 
 		if (typeof content === "string") {
 			text = content;
@@ -2364,8 +2411,10 @@ export class AgentSession {
 			for (const part of content) {
 				if (part.type === "text") {
 					textParts.push(part.text);
-				} else {
+				} else if (part.type === "image") {
 					images.push(part);
+				} else if (part.type === "media_reference") {
+					media.push(part);
 				}
 			}
 			text = textParts.join("\n");
@@ -2376,6 +2425,7 @@ export class AgentSession {
 			expandPromptTemplates: options?.expandPromptTemplates ?? false,
 			streamingBehavior: options?.deliverAs,
 			images,
+			media,
 			source: "extension",
 		});
 	}
@@ -2385,14 +2435,15 @@ export class AgentSession {
 	 * Useful for restoring to editor when user aborts.
 	 * @returns Object with steering and followUp arrays
 	 */
-	clearQueue(): { steering: string[]; followUp: string[] } {
+	clearQueue(): { steering: string[]; followUp: string[]; media: MediaReferenceContent[] } {
+		const media = mediaReferences(this.agent.getQueuedMessages());
 		const steering = [...this._steeringMessages];
 		const followUp = [...this._followUpMessages];
 		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
-		return { steering, followUp };
+		return { steering, followUp, media };
 	}
 
 	/** Number of pending messages (includes both steering and follow-up) */
@@ -3344,6 +3395,7 @@ export class AgentSession {
 	}
 
 	private _bindExtensionCore(runner: ExtensionRunner): void {
+		runner.bindMedia(this.media);
 		const getCommands = (): SlashCommandInfo[] => {
 			const extensionCommands: SlashCommandInfo[] = runner.getRegisteredCommands().map((command) => ({
 				name: command.invocationName,
@@ -3647,6 +3699,7 @@ export class AgentSession {
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
+		await this.media.dispose();
 		oldRunner.invalidate();
 		const previousDefaultTools = new Set(
 			this._usesDefaultTools ? (this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES) : [],
@@ -4077,11 +4130,21 @@ export class AgentSession {
 			if (targetEntry.type === "message" && targetEntry.message.role === "user") {
 				// User message: leaf = parent (null if root), text goes to editor
 				newLeafId = targetEntry.parentId;
-				editorText = contentText(targetEntry.message.content, "");
+				editorText = contentText(
+					typeof targetEntry.message.content === "string"
+						? targetEntry.message.content
+						: targetEntry.message.content.filter((b) => b.type === "text"),
+					"",
+				);
 			} else if (targetEntry.type === "custom_message") {
 				// Custom message: leaf = parent (null if root), text goes to editor
 				newLeafId = targetEntry.parentId;
-				editorText = contentText(targetEntry.content, "");
+				editorText = contentText(
+					typeof targetEntry.content === "string"
+						? targetEntry.content
+						: targetEntry.content.filter((b) => b.type === "text"),
+					"",
+				);
 			} else {
 				// Non-user message: leaf = selected node
 				newLeafId = targetId;
@@ -4151,7 +4214,12 @@ export class AgentSession {
 			if (entry.type !== "message") continue;
 			if (entry.message.role !== "user") continue;
 
-			const text = contentText(entry.message.content, "");
+			const text = contentText(
+				typeof entry.message.content === "string"
+					? entry.message.content
+					: entry.message.content.filter((b) => b.type === "text"),
+				"",
+			);
 			if (text) {
 				result.push({ entryId: entry.id, text });
 			}

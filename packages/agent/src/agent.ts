@@ -6,7 +6,6 @@ import {
 	type Message,
 	type Model,
 	type SimpleStreamOptions,
-	type TextContent,
 	type ThinkingBudgets,
 	type Transport,
 	toToolDeclaration,
@@ -16,6 +15,7 @@ import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
 	AfterToolCallResult,
+	AgentContent,
 	AgentContext,
 	AgentEvent,
 	AgentLoopConfig,
@@ -36,13 +36,29 @@ import type {
 export type { QueueMode } from "./types.ts";
 
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
-	return messages.filter(
-		(message) =>
-			message.role === "system" ||
-			message.role === "user" ||
-			message.role === "assistant" ||
-			message.role === "toolResult",
-	);
+	return messages
+		.filter(
+			(message) =>
+				message.role === "system" ||
+				message.role === "user" ||
+				message.role === "assistant" ||
+				message.role === "toolResult",
+		)
+		.map((message): Message => {
+			if (message.role === "user" || message.role === "toolResult") {
+				if (Array.isArray(message.content)) {
+					const content = message.content.map((block) => {
+						if (block.type !== "text" && block.type !== "image")
+							throw new Error("Custom agent content requires an explicit provider converter");
+						return block;
+					});
+					return { ...message, content };
+				}
+			}
+			if (message.role === "toolResult") throw new Error("Invalid tool result content");
+			if (message.role === "user") return { ...message, content: String(message.content) };
+			return message;
+		});
 }
 
 const EMPTY_USAGE = {
@@ -168,6 +184,9 @@ class PendingMessageQueue {
 		return drained;
 	}
 
+	all(): AgentMessage[] {
+		return this.messages.slice();
+	}
 	clear(): void {
 		this.messages = [];
 	}
@@ -316,6 +335,9 @@ export class Agent {
 	}
 
 	/** Remove all queued steering and follow-up messages. */
+	getQueuedMessages(): AgentMessage[] {
+		return [...this.steeringQueue.all(), ...this.followUpQueue.all()];
+	}
 	clearAllQueues(): void {
 		this.clearSteeringQueue();
 		this.clearFollowUpQueue();
@@ -422,7 +444,7 @@ export class Agent {
 			return [input];
 		}
 
-		const content: Array<TextContent | ImageContent> = [{ type: "text", text: input }];
+		const content: AgentContent[] = [{ type: "text", text: input }];
 		if (images && images.length > 0) {
 			content.push(...images);
 		}

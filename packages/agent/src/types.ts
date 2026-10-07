@@ -13,6 +13,7 @@ import type {
 	ToolResultMessage,
 	TranscriptContext,
 	Usage,
+	UserMessage,
 } from "@earendil-works/pi-ai";
 import type { Static, TSchema } from "typebox";
 
@@ -90,7 +91,7 @@ export interface BeforeToolCallResult {
  * There is no deep merge for `content`, `details`, or `usage`.
  */
 export interface AfterToolCallResult {
-	content?: (TextContent | ImageContent)[];
+	content?: AgentContent[];
 	details?: unknown;
 	structuredContent?: JsonValue;
 	isError?: boolean;
@@ -136,7 +137,7 @@ export interface AgentTurnContext {
 	/** The assistant message that completed the turn. */
 	message: AssistantMessage;
 	/** Tool result messages emitted for the completed turn. */
-	toolResults: ToolResultMessage[];
+	toolResults: AgentToolResultMessage[];
 	/** Current agent context after the turn's assistant message and tool results have been appended. */
 	context: AgentContext;
 	/** Messages that this loop invocation will return if it exits at this point. Prompt runs include the initial prompt messages; continuation runs do not include pre-existing context messages. */
@@ -371,7 +372,20 @@ export interface CustomAgentMessages {
  * This abstraction allows apps to add custom message types while maintaining
  * type safety and compatibility with the base LLM messages.
  */
-export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages];
+export interface CustomAgentContent {}
+export type AgentContent = TextContent | ImageContent | CustomAgentContent[keyof CustomAgentContent];
+export interface AgentUserMessage extends Omit<UserMessage, "content"> {
+	content: string | AgentContent[];
+}
+export interface AgentToolResultMessage<T = any> extends Omit<ToolResultMessage, "content" | "details"> {
+	content: AgentContent[];
+	details?: T;
+}
+export type AgentMessage =
+	| Exclude<Message, UserMessage | ToolResultMessage>
+	| AgentUserMessage
+	| AgentToolResultMessage
+	| CustomAgentMessages[keyof CustomAgentMessages];
 
 /**
  * Public agent state.
@@ -423,7 +437,7 @@ export interface AgentState {
 /** Final or partial result produced by a tool. */
 export interface AgentToolResult<T = JsonValue | undefined> {
 	/** Text or image content returned to the model. */
-	content: (TextContent | ImageContent)[];
+	content: AgentContent[];
 	/** Arbitrary structured details for logs or UI rendering. */
 	details: T;
 	/**
@@ -517,7 +531,7 @@ export type AgentEvent =
 	| { type: "agent_end"; messages: AgentMessage[] }
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
 	| { type: "turn_start" }
-	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
+	| { type: "turn_end"; message: AgentMessage; toolResults: AgentToolResultMessage[] }
 	// Message lifecycle - emitted for system, user, assistant, and toolResult messages
 	| { type: "message_start"; message: AgentMessage }
 	// Only emitted for assistant messages during streaming

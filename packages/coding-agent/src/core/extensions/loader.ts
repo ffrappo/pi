@@ -154,6 +154,7 @@ function useExtensionCacheCwd(cwd: string): ExtensionCacheToken {
  * Create a runtime with throwing stubs for action methods.
  * Runner.bindCore() replaces these with real implementations.
  */
+import type { MediaService } from "../media/types.ts";
 export function createExtensionRuntime(): ExtensionRuntime {
 	const notInitialized = () => {
 		throw new Error("Extension runtime not initialized. Action methods cannot be called during extension loading.");
@@ -167,6 +168,18 @@ export function createExtensionRuntime(): ExtensionRuntime {
 	};
 
 	const runtime: ExtensionRuntime = {
+		registerMediaService: (service) => {
+			if (service.contract !== "pi.media.v1") throw new Error("Unsupported media contract");
+			if (runtime.pendingMediaService && runtime.pendingMediaService !== service)
+				throw new Error("Competing media service registration");
+			runtime.pendingMediaService = service;
+			let active = true;
+			return () => {
+				if (!active) return;
+				active = false;
+				if (runtime.pendingMediaService === service) runtime.pendingMediaService = undefined;
+			};
+		},
 		sendMessage: notInitialized,
 		sendUserMessage: notInitialized,
 		appendEntry: notInitialized,
@@ -268,6 +281,11 @@ function createExtensionAPI(
 	};
 
 	const api = {
+		mediaCapabilities: "pi.media.v1" as const,
+		registerMediaService(service: MediaService) {
+			assertActive();
+			return runtime.registerMediaService(service);
+		},
 		// Registration methods - write to extension
 		on(event: string, handler: HandlerFn): () => void {
 			assertActive();

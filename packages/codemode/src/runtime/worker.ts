@@ -75,6 +75,10 @@ async function main(data: WorkerData): Promise<void> {
 				});
 				break;
 			case "output":
+				if (a.toString() === "media_reference") {
+					post({ type: "output", item: JSON.parse(b.toString()) });
+					break;
+				}
 				post({
 					type: "output",
 					item:

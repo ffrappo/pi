@@ -9,10 +9,12 @@
  */
 
 import type {
+	AgentContent,
 	AgentMessage,
 	AgentTool,
 	AgentToolCallOutcome,
 	AgentToolResult,
+	AgentToolResultMessage,
 	AgentToolUpdateCallback,
 	ThinkingLevel,
 	ToolExecutionMode,
@@ -38,8 +40,6 @@ import type {
 	ProviderImages,
 	RefreshModelsContext,
 	SimpleStreamOptions,
-	TextContent,
-	ToolResultMessage,
 	TranscriptContext,
 	Usage,
 } from "@earendil-works/pi-ai";
@@ -64,6 +64,7 @@ import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
 import type { McpServerConfig, McpServerRegistry, RegisteredMcpServer } from "../mcp-servers.ts";
+import type { MediaHandle, MediaService } from "../media/types.ts";
 import type { CustomMessage } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
@@ -333,6 +334,7 @@ export interface ExtensionContext {
 	cwd: string;
 	/** Session manager (read-only) */
 	sessionManager: ReadonlySessionManager;
+	readonly media?: MediaHandle;
 	/** Model registry for API key resolution */
 	modelRegistry: ModelRegistry;
 	/** Current model (may be undefined) */
@@ -446,7 +448,7 @@ export interface ReplacedSessionContext extends ExtensionCommandContext {
 	): Promise<void>;
 
 	sendUserMessage(
-		content: string | (TextContent | ImageContent)[],
+		content: string | AgentContent[],
 		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 	): Promise<void>;
 }
@@ -943,7 +945,7 @@ export interface CustomEntryDraft {
 export interface CustomMessageEntryDraft {
 	type: "custom_message";
 	customType: string;
-	content: string | (TextContent | ImageContent)[];
+	content: string | AgentContent[];
 	display: boolean;
 	details?: unknown;
 }
@@ -1029,7 +1031,7 @@ export interface TurnEndEvent extends BoundaryState {
 	type: "turn_end";
 	turnIndex: number;
 	message: AgentMessage;
-	toolResults: ToolResultMessage[];
+	toolResults: AgentToolResultMessage[];
 	messageEntryId: string;
 	toolResultEntryIds: string[];
 }
@@ -1232,7 +1234,7 @@ interface ToolResultEventBase {
 	/** Set when another tool (for example a codemode script) issued this call. */
 	parentToolCallId?: string;
 	input: Record<string, unknown>;
-	content: (TextContent | ImageContent)[];
+	content: AgentContent[];
 	/**
 	 * Machine-readable result for tools that declare an `outputSchema`. Handlers that redact
 	 * `content` should also replace this; replacing `content` alone drops it.
@@ -1442,7 +1444,7 @@ export type UserBashEventResult =
  * longer match. Return it along with `content` to keep it.
  */
 export interface ToolResultEventResult {
-	content?: (TextContent | ImageContent)[];
+	content?: AgentContent[];
 	details?: unknown;
 	structuredContent?: JsonValue;
 	isError?: boolean;
@@ -1551,6 +1553,8 @@ export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContex
  * ExtensionAPI passed to extension factory functions.
  */
 export interface ExtensionAPI {
+	readonly mediaCapabilities: "pi.media.v1";
+	registerMediaService(service: MediaService): () => void;
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
@@ -1700,7 +1704,7 @@ export interface ExtensionAPI {
 	 * Set expandPromptTemplates to dispatch extension commands and expand skill commands and prompt templates.
 	 */
 	sendUserMessage(
-		content: string | (TextContent | ImageContent)[],
+		content: string | AgentContent[],
 		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 	): void;
 
@@ -2067,7 +2071,7 @@ export type SendMessageHandler = <T = unknown>(
 ) => void;
 
 export type SendUserMessageHandler = (
-	content: string | (TextContent | ImageContent)[],
+	content: string | AgentContent[],
 	options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 ) => void;
 
@@ -2110,6 +2114,9 @@ export type SetLabelHandler = (entryId: string, label: string | undefined) => vo
  * Contains flag values (defaults set during registration, CLI values set after).
  */
 export interface ExtensionRuntimeState {
+	pendingMediaService?: MediaService;
+	media?: MediaHandle;
+	registerMediaService: (service: MediaService) => () => void;
 	flagValues: Map<string, boolean | string>;
 	/** Legacy provider-config registrations queued during extension loading, processed when runner binds. */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; extensionPath: string }>;

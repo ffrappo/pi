@@ -3,7 +3,7 @@
  * execute.lazy.ts so the sandbox runtime only loads when a script runs.
  */
 
-import type { AgentTool, AgentToolCallOutcome, AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { AgentContent, AgentTool, AgentToolCallOutcome, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type {
 	AnyModel,
 	ClassifierContext,
@@ -25,6 +25,7 @@ import {
 } from "@earendil-works/pi-codemode";
 import { getCodemodeWorkerSpecifier, getQuickJSWasmPath } from "../../config.ts";
 import type { ExtensionToolContext, ToolNamespace } from "../../core/extensions/types.ts";
+import { assertMediaReference } from "../../core/media/types.ts";
 import type { SessionEntry } from "../../core/session-manager.ts";
 import { formatSize } from "../../core/tools/truncate.ts";
 import { combineUsage } from "../../core/usage-totals.ts";
@@ -278,7 +279,11 @@ const IMAGE_EXTENSIONS: Record<string, string> = {
  * image but has no other way to reach its bytes: scripts cannot write files, and `write` only takes
  * text. Images shown more than once are saved once.
  */
-async function saveImages(items: (TextContent | ImageContent)[]): Promise<(TextContent | ImageContent)[]> {
+async function saveImages(
+	items: AgentContent[],
+	ctx?: ExtensionToolContext,
+	signal?: AbortSignal,
+): Promise<AgentContent[]> {
 	const labels = new Map<string, Promise<string>>();
 	const label = async ({ data, mimeType }: ImageContent): Promise<string> => {
 		const bytes = Buffer.from(data, "base64");
@@ -295,8 +300,19 @@ async function saveImages(items: (TextContent | ImageContent)[]): Promise<(TextC
 		}
 	};
 	const result = await Promise.all(
-		items.map(async (item): Promise<(TextContent | ImageContent)[]> => {
+		items.map(async (item): Promise<AgentContent[]> => {
+			if (item.type === "media_reference") {
+				assertMediaReference(item);
+				return [item];
+			}
 			if (item.type !== "image") return [item];
+			if (ctx?.media) {
+				const ref = await ctx.media.capture(
+					{ source: "bytes", data: item.data, mimeType: item.mimeType, ingress: "codemode", intent: "inspect" },
+					signal,
+				);
+				return [ref];
+			}
 			let pending = labels.get(item.data);
 			if (!pending) {
 				pending = label(item);
@@ -314,9 +330,9 @@ async function saveImages(items: (TextContent | ImageContent)[]): Promise<(TextC
  * a temp file.
  */
 async function truncateOutput(
-	items: (TextContent | ImageContent)[],
+	items: AgentContent[],
 	maxTokens: number,
-): Promise<{ items: (TextContent | ImageContent)[]; fullOutputPath?: string }> {
+): Promise<{ items: AgentContent[]; fullOutputPath?: string }> {
 	const texts = items.filter((item): item is TextContent => item.type === "text").map((item) => item.text);
 	const combined = texts.join("\n");
 	const budget = maxTokens * CHARS_PER_TOKEN;
@@ -333,7 +349,7 @@ async function truncateOutput(
 			? `\n\n[Full output: ${spilled.path} (read with offset/limit)]`
 			: `\n\n[Could not save the full output: ${spilled.error}]`;
 	return {
-		items: [{ type: "text", text }, ...items.filter((item) => item.type === "image")],
+		items: [{ type: "text", text }, ...items.filter((item) => item.type !== "text")],
 		...("path" in spilled ? { fullOutputPath: spilled.path } : {}),
 	};
 }
@@ -442,7 +458,7 @@ export async function executeCodemode(
 		if (call.status === "running") call.status = "cancelled";
 	}
 
-	const items: (TextContent | ImageContent)[] = result.output.map((item) =>
+	const items: AgentContent[] = result.output.map((item) =>
 		item.type === "text" ? { type: "text", text: item.text } : item,
 	);
 	if (result.ok) {
@@ -465,7 +481,7 @@ export async function executeCodemode(
 	const truncated = await truncateOutput(items, sourceOptions.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS);
 	// After truncation, which joins the text items and moves images after them, so each path stays
 	// next to its image and is never cut.
-	const output = await saveImages(truncated.items);
+	const output = await saveImages(truncated.items, ctx, signal);
 	const wallTime = ((performance.now() - startedAt) / 1000).toFixed(1);
 	const header = `${result.ok ? "Script completed" : "Script failed"}\nWall time ${wallTime} seconds\nOutput:\n`;
 	const details = snapshot();

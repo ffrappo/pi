@@ -208,23 +208,30 @@ async function runAuthCommand(args: string[]): Promise<boolean> {
 	return true;
 }
 
+import type { MediaCaptureInput } from "./core/media/types.ts";
+
 async function prepareInitialMessage(
 	parsed: Args,
 	stdinContent?: string,
 ): Promise<{
 	initialMessage?: string;
 	initialImages?: ImageContent[];
+	initialMedia?: MediaCaptureInput[];
 }> {
 	if (parsed.fileArgs.length === 0) {
 		return buildInitialMessage({ parsed, stdinContent });
 	}
 
 	// AgentSession resizes these after extension hooks select the request model.
-	const { text, images } = await processFileArguments(parsed.fileArgs, { autoResizeImages: false });
+	const { text, images, media } = await processFileArguments(parsed.fileArgs, {
+		autoResizeImages: false,
+		durableMedia: true,
+	});
 	return buildInitialMessage({
 		parsed,
 		fileText: text,
 		fileImages: images,
+		fileMedia: media,
 		stdinContent,
 	});
 }
@@ -898,7 +905,7 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("readPipedStdin");
 
-	const { initialMessage, initialImages } = await prepareInitialMessage(parsed, stdinContent);
+	const { initialMessage, initialImages, initialMedia } = await prepareInitialMessage(parsed, stdinContent);
 	time("prepareInitialMessage");
 	// pi reads user-authored themes, so it opts into full validation before any theme loads.
 	setThemeJsonValidator(validateThemeJson);
@@ -956,6 +963,7 @@ export async function main(args: string[], options?: MainOptions) {
 			autoTrustOnReloadCwd,
 			initialMessage,
 			initialImages,
+			initialMedia,
 			initialMessages: parsed.messages,
 			verbose: parsed.verbose,
 			tuiMode: parsed.tuiMode,
@@ -988,6 +996,7 @@ export async function main(args: string[], options?: MainOptions) {
 			messages: parsed.messages,
 			initialMessage,
 			initialImages,
+			initialMedia,
 		});
 		stopThemeWatcher();
 		restoreStdout();

@@ -5,8 +5,10 @@
  * and provides a transformer to convert them to LLM-compatible messages.
  */
 
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import type { AgentContent, AgentMessage } from "@earendil-works/pi-agent-core";
+import type { Message } from "@earendil-works/pi-ai";
+import { projectMediaContent } from "./media/content.ts";
+import "./media/types.ts";
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
 
@@ -46,7 +48,7 @@ export interface BashExecutionMessage {
 export interface CustomMessage<T = unknown> {
 	role: "custom";
 	customType: string;
-	content: string | (TextContent | ImageContent)[];
+	content: string | AgentContent[];
 	display: boolean;
 	details?: T;
 	timestamp: number;
@@ -122,7 +124,7 @@ export function createCompactionSummaryMessage(
 /** Convert CustomMessageEntry to AgentMessage format */
 export function createCustomMessage(
 	customType: string,
-	content: string | (TextContent | ImageContent)[],
+	content: string | AgentContent[],
 	display: boolean,
 	details: unknown | undefined,
 	timestamp: string,
@@ -163,7 +165,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 					const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
 					return {
 						role: "user",
-						content,
+						content: projectMediaContent(content),
 						timestamp: m.timestamp,
 					};
 				}
@@ -181,10 +183,15 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						],
 						timestamp: m.timestamp,
 					};
-				case "system":
 				case "user":
-				case "assistant":
+					return { ...m, content: projectMediaContent(m.content) };
 				case "toolResult":
+					return {
+						...m,
+						content: projectMediaContent(m.content) as Exclude<ReturnType<typeof projectMediaContent>, string>,
+					};
+				case "system":
+				case "assistant":
 					return m;
 				default:
 					// biome-ignore lint/correctness/noSwitchDeclarations: fine

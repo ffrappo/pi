@@ -44,7 +44,21 @@ export interface CodemodeTool {
  * One item of the script's output, in the order the script produced it: `text()` and `console.*`
  * produce text items, `image()` image items. `data` is base64.
  */
-export type CodemodeOutputItem = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+export interface CodemodeMediaReference {
+	type: "media_reference";
+	schemaVersion: 1;
+	assetId: string;
+	store: { storeId: string; root: string };
+	kind: "image" | "video";
+	intent: "view" | "inspect";
+	blockId: string;
+	derivativeId?: string;
+	inspectionId?: string;
+}
+export type CodemodeOutputItem =
+	| { type: "text"; text: string }
+	| { type: "image"; data: string; mimeType: string }
+	| CodemodeMediaReference;
 
 export type CodemodeCallStatus = "ok" | "error" | "cancelled";
 

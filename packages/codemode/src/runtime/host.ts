@@ -27,6 +27,7 @@ const RESERVED_GLOBALS: ReadonlySet<string> = new Set([
 	"console",
 	"text",
 	"image",
+	"media",
 	"exit",
 	"globalThis",
 	"store",

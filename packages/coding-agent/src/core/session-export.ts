@@ -17,6 +17,7 @@ export function serializeSessionBranch(
 		id: sessionManager.getSessionId(),
 		timestamp,
 		cwd: sessionManager.getCwd(),
+		requiredMediaContract: sessionManager.getHeader()?.requiredMediaContract,
 	};
 	const entries: object[] = [header];
 	let parentId: string | null = null;

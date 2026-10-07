@@ -5,12 +5,13 @@
 
 import {
 	type Agent,
+	type AgentContent,
 	type AgentTool,
 	type AgentToolCallOutcome,
 	type AgentToolResult,
 	runToolCall,
 } from "@earendil-works/pi-agent-core";
-import type { ImageContent, JsonObject, JsonValue, TextContent } from "@earendil-works/pi-ai";
+import type { JsonObject, JsonValue, TextContent } from "@earendil-works/pi-ai";
 import {
 	type CodemodeJsonSchema,
 	CodemodeSandbox,
@@ -155,7 +156,7 @@ export function createCodemodeTool(
 			try {
 				const result = await sandbox.execute(params.code, { signal });
 				// Items from text(), console.*, and image(), in order. They have pi-ai's content shapes.
-				const content: (TextContent | ImageContent)[] = [...result.output];
+				const content: AgentContent[] = [...result.output];
 				if (result.ok && result.value !== undefined) {
 					const value = typeof result.value === "string" ? result.value : JSON.stringify(result.value);
 					content.push({ type: "text", text: value });

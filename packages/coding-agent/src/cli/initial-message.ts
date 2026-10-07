@@ -1,16 +1,19 @@
 import type { ImageContent } from "@earendil-works/pi-ai";
+import type { MediaCaptureInput } from "../core/media/types.ts";
 import type { Args } from "./args.ts";
 
 export interface InitialMessageInput {
 	parsed: Args;
 	fileText?: string;
 	fileImages?: ImageContent[];
+	fileMedia?: MediaCaptureInput[];
 	stdinContent?: string;
 }
 
 export interface InitialMessageResult {
 	initialMessage?: string;
 	initialImages?: ImageContent[];
+	initialMedia?: MediaCaptureInput[];
 }
 
 /**
@@ -21,6 +24,7 @@ export function buildInitialMessage({
 	parsed,
 	fileText,
 	fileImages,
+	fileMedia,
 	stdinContent,
 }: InitialMessageInput): InitialMessageResult {
 	const parts: string[] = [];
@@ -39,5 +43,6 @@ export function buildInitialMessage({
 	return {
 		initialMessage: parts.length > 0 ? parts.join("") : undefined,
 		initialImages: fileImages && fileImages.length > 0 ? fileImages : undefined,
+		initialMedia: fileMedia,
 	};
 }

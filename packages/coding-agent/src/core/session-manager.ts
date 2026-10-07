@@ -1,14 +1,16 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type {
+	AgentContent,
+	AgentMessage,
+	AgentToolResultMessage,
+	AgentUserMessage,
+} from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	getCurrentSystemMessage,
-	type ImageContent,
 	type Message,
 	type SystemMessage,
 	type TextContent,
-	type ToolResultMessage,
 	type Usage,
-	type UserMessage,
 	uuidv7,
 } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
@@ -31,14 +33,15 @@ import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
+import { activeMediaCheckpoint, checkpointMessages, maskClosedMedia, replayMediaPolicy } from "./media/policy.ts";
+import { type ActiveMediaCheckpoint, MEDIA_CONTRACT } from "./media/types.ts";
 import {
-	type BashExecutionMessage,
 	type CustomMessage,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
-export const CURRENT_SESSION_VERSION = 3;
+export const CURRENT_SESSION_VERSION = 4;
 
 export interface SessionHeader {
 	type: "session";
@@ -47,6 +50,7 @@ export interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	requiredMediaContract?: typeof MEDIA_CONTRACT;
 }
 
 export interface NewSessionOptions {
@@ -101,6 +105,7 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	fromHook?: boolean;
 	/** Complete prompt and tool state at this compaction boundary. */
 	systemMessage?: SystemMessage;
+	activeMedia?: ActiveMediaCheckpoint;
 }
 
 export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
@@ -159,16 +164,16 @@ export interface SessionInfoEntry extends SessionEntryBase {
 export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	type: "custom_message";
 	customType: string;
-	content: string | (TextContent | ImageContent)[];
+	content: string | AgentContent[];
 	details?: T;
 	display: boolean;
 }
 
 /** Content that an append-only context edit may replace without changing message metadata. */
 export type ContextEditableContent =
-	| UserMessage["content"]
+	| AgentUserMessage["content"]
 	| AssistantMessage["content"]
-	| ToolResultMessage["content"]
+	| AgentToolResultMessage["content"]
 	| CustomMessage["content"];
 
 /** Append-only change to one earlier entry's contribution to model context. */
@@ -338,7 +343,10 @@ function migrateToCurrentVersion(entries: FileEntry[]): boolean {
 	const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
 	const version = header?.version ?? 1;
 
-	if (version >= CURRENT_SESSION_VERSION) return false;
+	if (version > CURRENT_SESSION_VERSION) throw new Error(`Unsupported session schema ${version}`);
+	if (header?.requiredMediaContract && header.requiredMediaContract !== MEDIA_CONTRACT)
+		throw new Error("Unsupported session media contract");
+	if (version >= 3) return false;
 
 	if (version < 2) migrateV1ToV2(entries);
 	if (version < 3) migrateV2ToV3(entries);
@@ -552,6 +560,7 @@ export function buildSessionProjection(
 	for (const entry of contextEntries) {
 		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
 	}
+	const policies = replayMediaPolicy(path);
 	const projectedEntries = contextEntries.map(
 		(sourceEntry, index): ProjectedSessionEntry => ({
 			sourceEntry,
@@ -564,6 +573,29 @@ export function buildSessionProjection(
 					: projectContextEntry(sourceEntry, edits.get(sourceEntry.id)),
 		}),
 	);
+	for (const projected of projectedEntries)
+		projected.messages = projected.messages.map((m) => maskClosedMedia(m, policies));
+	const latest = projectedEntries.find((p) => p.sourceEntry.type === "compaction");
+	if (latest && latest.sourceEntry.type === "compaction") {
+		latest.messages.push(
+			...checkpointMessages(
+				latest.sourceEntry.activeMedia,
+				projectedEntries.flatMap((p) => p.messages),
+				policies,
+				new Date(latest.sourceEntry.timestamp).getTime(),
+			),
+		);
+	}
+	const policyEvidence = checkpointMessages(
+		activeMediaCheckpoint(path),
+		projectedEntries.flatMap((p) => p.messages),
+		policies,
+		Date.now(),
+	);
+	if (policyEvidence.length) {
+		const policySource = path.findLast((e) => e.type === "custom" && e.customType === "pi.media.policy.v1");
+		if (policySource) projectedEntries.push({ sourceEntry: policySource, messages: policyEvidence });
+	}
 	return {
 		entries: projectedEntries,
 		messages: projectedEntries.flatMap((entry) => entry.messages),
@@ -1189,6 +1221,16 @@ export class SessionManager {
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		const header = this.fileEntries[0];
+		if (
+			header?.type === "session" &&
+			!header.requiredMediaContract &&
+			JSON.stringify(entry).includes("media_reference")
+		) {
+			header.version = CURRENT_SESSION_VERSION;
+			header.requiredMediaContract = MEDIA_CONTRACT;
+			if (this.flushed) this._rewriteFile();
+		}
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
@@ -1201,7 +1243,7 @@ export class SessionManager {
 	 * so it is easier to find them.
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
 	 */
-	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+	appendMessage(message: Exclude<AgentMessage, { role: "compactionSummary" | "branchSummary" }>): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
@@ -1271,6 +1313,7 @@ export class SessionManager {
 		const id = generateId(this.byId);
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
+			activeMedia: activeMediaCheckpoint(this.getBranch()),
 			id,
 			parentId: this.leafId,
 			timestamp,
@@ -1338,7 +1381,7 @@ export class SessionManager {
 	 */
 	appendCustomMessageEntry<T = unknown>(
 		customType: string,
-		content: string | (TextContent | ImageContent)[],
+		content: string | AgentContent[],
 		display: boolean,
 		details?: T,
 	): string {
@@ -1675,6 +1718,7 @@ export class SessionManager {
 		const header: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
+			requiredMediaContract: this.getHeader()?.requiredMediaContract,
 			id: newSessionId,
 			timestamp,
 			cwd: this.cwd,
@@ -1848,6 +1892,7 @@ export class SessionManager {
 		const newHeader: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
+			requiredMediaContract: sourceHeader.requiredMediaContract,
 			id: newSessionId,
 			timestamp,
 			cwd: resolvedTargetCwd,

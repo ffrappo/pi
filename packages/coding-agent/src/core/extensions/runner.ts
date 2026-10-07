@@ -354,6 +354,7 @@ const noOpUIContext: ExtensionUIContext = {
 	setToolsExpanded: () => {},
 };
 
+import type { SessionMedia } from "../media/runtime.ts";
 export class ExtensionRunner {
 	private extensions: Extension[];
 	private runtime: ExtensionRuntime;
@@ -405,6 +406,12 @@ export class ExtensionRunner {
 		this.cwd = cwd;
 		this.sessionManager = sessionManager;
 		this.modelRegistry = modelRegistry;
+	}
+
+	bindMedia(media: SessionMedia): void {
+		this.runtime.media = media;
+		if (this.runtime.pendingMediaService) media.register(this.runtime.pendingMediaService);
+		this.runtime.registerMediaService = (service) => media.register(service);
 	}
 
 	bindCore(
@@ -879,6 +886,10 @@ export class ExtensionRunner {
 		const getModel = this.getModel;
 		const getScopedModels = this.getScopedModels;
 		return {
+			get media() {
+				runner.assertActive();
+				return runner.runtime.media;
+			},
 			get ui() {
 				runner.assertActive();
 				return runner.uiContext;

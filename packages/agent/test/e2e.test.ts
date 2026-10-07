@@ -8,11 +8,10 @@ import {
 	type Model,
 	registerFauxProvider,
 	streamSimple,
-	type ToolResultMessage,
 	type UserMessage,
 } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it } from "vitest";
-import { Agent, type AgentEvent } from "../src/index.ts";
+import { Agent, type AgentEvent, type AgentToolResultMessage } from "../src/index.ts";
 import { calculateTool } from "./utils/calculate.ts";
 
 const registrations: FauxProviderRegistration[] = [];
@@ -23,7 +22,7 @@ function createFauxRegistration(options: Parameters<typeof registerFauxProvider>
 	return registration;
 }
 
-function getTextContent(message: AssistantMessage | ToolResultMessage): string {
+function getTextContent(message: AssistantMessage | AgentToolResultMessage): string {
 	return message.content
 		.filter((block) => block.type === "text")
 		.map((block) => block.text)
@@ -391,7 +390,7 @@ describe("Agent.continue() with faux provider", () => {
 				timestamp: Date.now(),
 			};
 
-			const toolResult: ToolResultMessage = {
+			const toolResult: AgentToolResultMessage = {
 				role: "toolResult",
 				toolCallId: "calc-1",
 				toolName: "calculate",

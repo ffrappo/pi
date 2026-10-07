@@ -17,11 +17,23 @@ import type { SourceInfo } from "../../core/source-info.ts";
 // RPC Commands (stdin)
 // ============================================================================
 
+import type { MediaCaptureInput, MediaReferenceContent } from "../../core/media/types.ts";
 export type RpcCommand =
+	| { id?: string; type: "media_list" }
+	| { id?: string; type: "media_capture"; input: MediaCaptureInput }
+	| { id?: string; type: "media_describe" | "media_open" | "media_inspect"; reference: MediaReferenceContent }
+	| { id?: string; type: "media_finish"; inspectionId: string; reason: string; observation?: string }
 	// Prompting
-	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
-	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
-	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
+	| {
+			id?: string;
+			type: "prompt";
+			message: string;
+			images?: ImageContent[];
+			media?: MediaReferenceContent[];
+			streamingBehavior?: "steer" | "followUp";
+	  }
+	| { id?: string; type: "steer"; message: string; images?: ImageContent[]; media?: MediaReferenceContent[] }
+	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[]; media?: MediaReferenceContent[] }
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "clear_queue" }
 	| { id?: string; type: "new_session"; parentSession?: string }
@@ -94,6 +106,7 @@ export interface RpcSlashCommand {
 // ============================================================================
 
 export interface RpcSessionState {
+	mediaCapabilities?: "pi.media.v1";
 	model?: Model<any>;
 	thinkingLevel: ThinkingLevel;
 	isStreaming: boolean;
@@ -114,6 +127,13 @@ export interface RpcSessionState {
 
 // Success responses with data
 export type RpcResponse =
+	| {
+			id?: string;
+			type: "response";
+			command: "media_list" | "media_capture" | "media_describe" | "media_open" | "media_inspect" | "media_finish";
+			success: true;
+			data?: unknown;
+	  }
 	// Prompting
 	| { id?: string; type: "response"; command: "prompt"; success: true; data: { disposition: PromptDisposition } }
 	| { id?: string; type: "response"; command: "steer"; success: true; data: { disposition: QueuedInputDisposition } }

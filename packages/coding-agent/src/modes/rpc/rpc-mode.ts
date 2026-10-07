@@ -387,6 +387,19 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		const id = command.id;
 
 		switch (command.type) {
+			case "media_list":
+				return success(id, "media_list", session.media.list());
+			case "media_capture":
+				return success(id, "media_capture", await session.media.capture(command.input));
+			case "media_describe":
+				return success(id, "media_describe", await session.media.describe(command.reference));
+			case "media_open":
+				return success(id, "media_open", await session.media.open(command.reference));
+			case "media_inspect":
+				return success(id, "media_inspect", await session.media.inspect(command.reference));
+			case "media_finish":
+				await session.media.finish(command.inspectionId, command.reason, command.observation);
+				return success(id, "media_finish");
 			// =================================================================
 			// Prompting
 			// =================================================================
@@ -398,6 +411,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				void session
 					.prompt(command.message, {
 						images: command.images,
+						media: command.media,
 						streamingBehavior: command.streamingBehavior,
 						source: "rpc",
 						preflightResult: (disposition) => {
@@ -414,12 +428,18 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			}
 
 			case "steer": {
-				const disposition = await session.steer(command.message, command.images, { source: "rpc" });
+				const disposition = await session.steer(command.message, command.images, {
+					source: "rpc",
+					media: command.media,
+				});
 				return success(id, "steer", { disposition });
 			}
 
 			case "follow_up": {
-				const disposition = await session.followUp(command.message, command.images, { source: "rpc" });
+				const disposition = await session.followUp(command.message, command.images, {
+					source: "rpc",
+					media: command.media,
+				});
 				return success(id, "follow_up", { disposition });
 			}
 
@@ -447,6 +467,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 			case "get_state": {
 				const state: RpcSessionState = {
+					mediaCapabilities: session.media.capabilities,
 					model: session.model,
 					thinkingLevel: session.thinkingLevel,
 					isStreaming: session.isStreaming,

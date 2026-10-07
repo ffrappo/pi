@@ -83,11 +83,11 @@ describe("convertToPng", () => {
 });
 
 // Issue #10292: pi-tui uses this transcoder to show non-PNG images on Kitty-protocol terminals.
-it("loadPngTranscoder converts synchronously to oriented PNG data", async () => {
+it("loadPngTranscoder converts asynchronously to oriented PNG data", async () => {
 	const transcoder = (await loadPngTranscoder())!;
-	const png = Buffer.from(transcoder(jpegWithXmpBeforeOrientation(), "image/jpeg")!, "base64");
+	const png = Buffer.from((await transcoder(jpegWithXmpBeforeOrientation(), "image/jpeg"))!, "base64");
 	expect([png.readUInt32BE(16), png.readUInt32BE(20)]).toEqual([1, 2]);
-	expect(transcoder(Buffer.from("not an image").toString("base64"), "image/jpeg")).toBeNull();
+	await expect(transcoder(Buffer.from("not an image").toString("base64"), "image/jpeg")).rejects.toThrow();
 });
 
 describe("resizeImage", () => {

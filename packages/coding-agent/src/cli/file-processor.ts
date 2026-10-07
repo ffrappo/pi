@@ -5,7 +5,8 @@
 import { access, readFile, stat } from "node:fs/promises";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import chalk from "chalk";
-import { resolve } from "path";
+import { extname, resolve } from "path";
+import type { MediaCaptureInput } from "../core/media/types.ts";
 import { resolveReadPath } from "../core/tools/path-utils.ts";
 import { processImage } from "../utils/image-process.ts";
 import { detectSupportedImageMimeTypeFromFile } from "../utils/mime.ts";
@@ -14,11 +15,13 @@ import { stripBom } from "../utils/text.ts";
 export interface ProcessedFiles {
 	text: string;
 	images: ImageContent[];
+	media: MediaCaptureInput[];
 }
 
 export interface ProcessFileOptions {
 	/** Whether to auto-resize images. Default: true */
 	autoResizeImages?: boolean;
+	durableMedia?: boolean;
 }
 
 /** Process @file arguments into text content and image attachments */
@@ -26,6 +29,7 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 	const autoResizeImages = options?.autoResizeImages ?? true;
 	let text = "";
 	const images: ImageContent[] = [];
+	const media: MediaCaptureInput[] = [];
 
 	for (const fileArg of fileArgs) {
 		// Expand and resolve path (handles ~ expansion and macOS screenshot Unicode spaces)
@@ -48,6 +52,13 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 
 		const mimeType = await detectSupportedImageMimeTypeFromFile(absolutePath);
 
+		const video = [".mp4", ".mov", ".webm", ".mkv", ".m4v"].includes(extname(absolutePath).toLowerCase());
+		if (options?.durableMedia && (mimeType || video)) {
+			media.push({ source: "path", path: absolutePath, ingress: "cli", intent: mimeType ? "inspect" : "view" });
+			text += `<file name="${absolutePath}"></file>\n`;
+			continue;
+		}
+		if (video) throw new Error(`Video @file requires durable media: ${absolutePath}`);
 		if (mimeType) {
 			// Handle image file
 			const content = await readFile(absolutePath);
@@ -84,5 +95,5 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 		}
 	}
 
-	return { text, images };
+	return { text, images, media };
 }

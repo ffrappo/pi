@@ -1,3 +1,6 @@
+export * from "./core/media/types.ts";
+export { prepareImagePreview } from "./utils/image-preview.ts";
+export type { ImageResizeOptions } from "./utils/image-resize.ts";
 // Core session management
 
 export { type Args, parseArgs } from "./cli/args.ts";

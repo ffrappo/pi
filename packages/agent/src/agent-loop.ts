@@ -10,7 +10,6 @@ import {
 	getToolStateChanges,
 	normalizeContext,
 	type SystemMessage,
-	type ToolResultMessage,
 	type ToolStateChanges,
 	toToolDeclaration,
 	validateToolArguments,
@@ -25,6 +24,7 @@ import type {
 	AgentToolCall,
 	AgentToolCallOutcome,
 	AgentToolResult,
+	AgentToolResultMessage,
 	PrepareNextTurnContext,
 	StreamFn,
 } from "./types.ts";
@@ -258,7 +258,7 @@ async function runLoop(
 			// Check for tool calls
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
 
-			const toolResults: ToolResultMessage[] = [];
+			const toolResults: AgentToolResultMessage[] = [];
 			hasMoreToolCalls = false;
 			if (toolCalls.length > 0) {
 				// A "length" stop means the output was cut off by the token limit, so
@@ -479,7 +479,7 @@ async function failToolCallsFromTruncatedMessage(
 	toolCalls: AgentToolCall[],
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
-	const messages: ToolResultMessage[] = [];
+	const messages: AgentToolResultMessage[] = [];
 	for (const toolCall of toolCalls) {
 		await emit({
 			type: "tool_execution_start",
@@ -523,7 +523,7 @@ async function executeToolCalls(
 }
 
 type ExecutedToolCallBatch = {
-	messages: ToolResultMessage[];
+	messages: AgentToolResultMessage[];
 	terminate: boolean;
 };
 
@@ -536,7 +536,7 @@ async function executeToolCallsSequential(
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
-	const messages: ToolResultMessage[] = [];
+	const messages: AgentToolResultMessage[] = [];
 
 	for (const toolCall of toolCalls) {
 		await emit({
@@ -646,7 +646,7 @@ async function executeToolCallsParallel(
 	const orderedFinalizedCalls = await Promise.all(
 		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
 	);
-	const messages: ToolResultMessage[] = [];
+	const messages: AgentToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
 		const toolResultMessage = createToolResultMessage(finalized);
 		await emitToolResultMessage(toolResultMessage, emit);
@@ -919,7 +919,7 @@ async function emitToolExecutionEnd(finalized: FinalizedToolCallOutcome, emit: A
 	});
 }
 
-function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResultMessage {
+function createToolResultMessage(finalized: FinalizedToolCallOutcome): AgentToolResultMessage {
 	return {
 		role: "toolResult",
 		toolCallId: finalized.toolCall.id,
@@ -934,7 +934,7 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 	};
 }
 
-async function emitToolResultMessage(toolResultMessage: ToolResultMessage, emit: AgentEventSink): Promise<void> {
+async function emitToolResultMessage(toolResultMessage: AgentToolResultMessage, emit: AgentEventSink): Promise<void> {
 	await emit({ type: "message_start", message: toolResultMessage });
 	await emit({ type: "message_end", message: toolResultMessage });
 }

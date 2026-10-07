@@ -278,7 +278,7 @@ export function createMcpToolDefinition(options: {
 		namespace: options.namespace,
 		...(annotations ? { annotations } : {}),
 		...createMcpToolRenderers(label),
-		async execute(_toolCallId, params, signal, onUpdate) {
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const client = await options.getClient();
 			const result = await client.callTool(tool.name, (params ?? {}) as Record<string, unknown>, {
 				signal,
@@ -289,7 +289,31 @@ export function createMcpToolDefinition(options: {
 					onUpdate?.({ content: [{ type: "text", text }], details: { server, tool: tool.name } });
 				},
 			});
-			return convertMcpResult(server, tool.name, result, { readableResources: options.readableResources?.() });
+			const converted = await convertMcpResult(server, tool.name, result, {
+				readableResources: options.readableResources?.(),
+			});
+			if (ctx.media) {
+				for (const block of result.content)
+					if (
+						block.type === "resource" &&
+						"blob" in block.resource &&
+						block.resource.mimeType?.startsWith("video/")
+					) {
+						converted.content.push(
+							await ctx.media.capture(
+								{
+									source: "bytes",
+									data: block.resource.blob,
+									mimeType: block.resource.mimeType,
+									ingress: "mcp",
+									intent: "view",
+								},
+								signal,
+							),
+						);
+					}
+			}
+			return converted;
 		},
 	};
 }

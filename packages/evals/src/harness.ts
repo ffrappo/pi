@@ -191,7 +191,13 @@ function toTranscriptEvents(messages: AgentSession["messages"]): TranscriptEvent
 	const events: TranscriptEvent[] = [];
 	for (const message of messages) {
 		if (message.role === "user") {
-			events.push({ type: "message", role: "user", content: contentText(message.content) });
+			events.push({
+				type: "message",
+				role: "user",
+				content: contentText(
+					typeof message.content === "string" ? message.content : message.content.filter((b) => b.type === "text"),
+				),
+			});
 			continue;
 		}
 		if (message.role === "assistant") {
@@ -209,7 +215,7 @@ function toTranscriptEvents(messages: AgentSession["messages"]): TranscriptEvent
 			continue;
 		}
 		if (message.role === "toolResult") {
-			const text = contentText(message.content);
+			const text = contentText(message.content.filter((b) => b.type === "text"));
 			events.push({
 				type: "tool_result",
 				toolCallId: message.toolCallId,

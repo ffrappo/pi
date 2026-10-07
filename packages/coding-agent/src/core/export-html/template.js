@@ -906,6 +906,10 @@
         return out;
       }
 
+      function renderMedia(block, cssClass) {
+        if (block.type === "media_reference") return `<details class="media-reference"><summary>${escapeHtml(block.kind)} ${escapeHtml(block.assetId.slice(0,19))}</summary><div>${escapeHtml(block.assetId)} · ${escapeHtml(block.intent)} · Original requires the project store or explicit media bundle.</div></details>`;
+        return `<details ontoggle="if(this.open){const i=this.querySelector('img');i.src=i.dataset.src}else{this.querySelector('img').removeAttribute('src')}"><summary>Stored image</summary><img data-src="data:${escapeHtml(block.mimeType || 'image/png')};base64,${escapeHtml(block.data || '')}" class="${cssClass}" loading="lazy" /></details>`;
+      }
       function renderToolCall(call) {
         const result = findToolResult(call.id);
         const isError = result?.isError || false;
@@ -919,14 +923,14 @@
 
         const getResultImages = () => {
           if (!result) return [];
-          return result.content.filter(c => c.type === 'image');
+          return result.content.filter(c => c.type === 'image' || c.type === 'media_reference');
         };
 
         const renderResultImages = () => {
           const images = getResultImages();
           if (images.length === 0) return '';
           return '<div class="tool-images">' +
-            images.map(img => `<img src="data:${escapeHtml(img.mimeType || 'image/png')};base64,${escapeHtml(img.data || '')}" class="tool-image" />`).join('') +
+            images.map(img => renderMedia(img,"tool-image")).join('') +
             '</div>';
         };
 
@@ -1209,7 +1213,7 @@
 
             if (skillBlock) {
               // Collect images from content array
-              const images = Array.isArray(content) ? content.filter(c => c.type === 'image') : [];
+              const images = Array.isArray(content) ? content.filter(c => c.type === 'image' || c.type === 'media_reference') : [];
               const hasUserContent = skillBlock.userMessage || images.length > 0;
               let html = `<div class="skill-user-entry" id="${entryDomId}">${copyBtnHtml}${tsHtml}`;
 
@@ -1225,9 +1229,7 @@
                 html += '<div class="user-message">';
                 if (images.length > 0) {
                   html += '<div class="message-images">';
-                  for (const img of images) {
-                    html += `<img src="data:${escapeHtml(img.mimeType || 'image/png')};base64,${escapeHtml(img.data || '')}" class="message-image" />`;
-                  }
+                  for (const img of images) html += renderMedia(img,"message-image");
                   html += '</div>';
                 }
                 if (skillBlock.userMessage) {
@@ -1244,12 +1246,10 @@
             let html = `<div class="user-message" id="${entryDomId}">${copyBtnHtml}${tsHtml}`;
 
             if (Array.isArray(content)) {
-              const images = content.filter(c => c.type === 'image');
+              const images = content.filter(c => c.type === 'image' || c.type === 'media_reference');
               if (images.length > 0) {
                 html += '<div class="message-images">';
-                for (const img of images) {
-                  html += `<img src="data:${escapeHtml(img.mimeType || 'image/png')};base64,${escapeHtml(img.data || '')}" class="message-image" />`;
-                }
+                for (const img of images) html += renderMedia(img,"message-image");
                 html += '</div>';
               }
             }

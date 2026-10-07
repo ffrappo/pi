@@ -398,7 +398,17 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 		["image/webp", /^UklG.{8}RUJQ/],
 	];
 
+	function media(value) {
+		if(value && value.mediaReference)value=value.mediaReference;
+		if (!value || value.type !== "media_reference" || value.schemaVersion !== 1 || !/^sha256:[a-f0-9]{64}$/.test(value.assetId) || !value.blockId || !value.store || !value.store.root || !value.store.storeId) throw new TypeErrorCtor("media expects a pi.media.v1 reference");
+		output("media_reference", stringify({...value,intent:"view"}));
+	}
 	function image(value) {
+		if(value && value.mediaReference)value=value.mediaReference;
+		if (value && value.type === "media_reference") {
+			if(value.schemaVersion!==1 || !value.blockId)throw new TypeErrorCtor("Invalid media reference");
+			output("media_reference",stringify({...value,intent:"inspect"})); return;
+		}
 		const url = imageUrl(value);
 		if (url === "") throw new TypeErrorCtor(${JSON.stringify(IMAGE_HELPER_EXPECTS)});
 		const colon = url.indexOf(":");
@@ -451,6 +461,7 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 	Object.defineProperty(globalThis, "console", { value: console, enumerable: true });
 	Object.defineProperty(globalThis, "text", { value: text, enumerable: true });
 	Object.defineProperty(globalThis, "image", { value: image, enumerable: true });
+	Object.defineProperty(globalThis, "media", { value: media, enumerable: true });
 	Object.defineProperty(globalThis, "exit", { value: exit, enumerable: true });
 
 	return {

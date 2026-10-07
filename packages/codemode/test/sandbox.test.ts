@@ -592,7 +592,13 @@ describe("limits and lifetime", () => {
 				error: { kind: "script", name: "RangeError", message: expect.stringContaining("script output exceeded") },
 			});
 			const chars = result.output.reduce(
-				(sum, item) => sum + (item.type === "text" ? item.text.length : item.data.length),
+				(sum, item) =>
+					sum +
+					(item.type === "text"
+						? item.text.length
+						: item.type === "image"
+							? item.data.length
+							: JSON.stringify(item).length),
 				0,
 			);
 			expect(chars).toBeLessThanOrEqual(MAX_OUTPUT_CHARS);

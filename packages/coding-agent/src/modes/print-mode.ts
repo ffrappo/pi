@@ -8,14 +8,15 @@
 
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
-import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
-import { killTrackedDetachedChildren } from "../utils/shell.ts";
-import { toJsonEvent } from "./json-event.ts";
-
 /**
  * Options for print mode.
  */
+import type { MediaCaptureInput } from "../core/media/types.ts";
+import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
+import { killTrackedDetachedChildren } from "../utils/shell.ts";
+import { toJsonEvent } from "./json-event.ts";
 export interface PrintModeOptions {
+	initialMedia?: MediaCaptureInput[];
 	/** Output mode: "text" for final response only, "json" for all events */
 	mode: "text" | "json";
 	/** Array of additional prompts to send after initialMessage */
@@ -31,7 +32,7 @@ export interface PrintModeOptions {
  * Sends prompts to the agent and outputs the result.
  */
 export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: PrintModeOptions): Promise<number> {
-	const { mode, messages = [], initialMessage, initialImages } = options;
+	const { mode, messages = [], initialMessage, initialImages, initialMedia } = options;
 	let exitCode = 0;
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
@@ -129,7 +130,8 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		await rebindSession();
 
 		if (initialMessage) {
-			await session.prompt(initialMessage, { images: initialImages });
+			const media = await Promise.all((initialMedia ?? []).map((input) => session.media.capture(input)));
+			await session.prompt(initialMessage, { images: initialImages, media });
 		}
 
 		for (const message of messages) {
