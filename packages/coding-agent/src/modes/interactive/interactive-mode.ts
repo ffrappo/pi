@@ -3125,7 +3125,7 @@ export class InteractiveMode {
 		// Handle clipboard paste (triggered on Ctrl+V). Copied files use their original paths,
 		// images are attached via temporary files, and plain text is the final fallback.
 		this.defaultEditor.onPaste = (text) => {
-			if (this.isBashMode) return;
+			if (this.isBashMode || !this.mediaUxEnabled()) return;
 			// A terminal cannot distinguish drop from pasted prose. Offer an action,
 			// never promote a path merely mentioned in the prompt.
 			const candidate = text.trim();
@@ -3157,8 +3157,20 @@ export class InteractiveMode {
 		}
 	}
 
+	private mediaUxEnabled(): boolean {
+		return this.session.settingsManager.getSettings().fornace?.media?.enabled !== false;
+	}
+
 	private async handleMediaCommand(command: string): Promise<void> {
 		try {
+			if (
+				!this.mediaUxEnabled() &&
+				(command === "/media" ||
+					command === "/attach" ||
+					command.startsWith("/attach ") ||
+					command.startsWith("/media staged "))
+			)
+				throw new Error("Media attachment and picker UI is disabled in fornace.media.enabled");
 			if (command === "/attach" || command.startsWith("/attach ")) {
 				let file = command.slice(7).trim();
 				if (!file) file = (await this.showExtensionInput("Attach", "Original file"))?.trim() ?? "";
@@ -3262,7 +3274,7 @@ export class InteractiveMode {
 				if (filePaths.some((filePath) => /\p{Cc}/u.test(filePath))) {
 					throw new Error("Clipboard file path contains control characters");
 				}
-				if (!this.isBashMode) {
+				if (!this.isBashMode && this.mediaUxEnabled()) {
 					for (const file of filePaths) {
 						const extension = path.extname(file).toLowerCase();
 						if ([".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mov", ".webm"].includes(extension))
@@ -3276,7 +3288,7 @@ export class InteractiveMode {
 					this.ui.requestRender();
 					return;
 				}
-				const paths = filePaths.map(quoteIfNeeded).join(" ");
+				const paths = this.isBashMode ? filePaths.map(quoteIfNeeded).join(" ") : filePaths.join("\n");
 				const cursor = this.editor.getCursor?.();
 				const currentLine = cursor ? (this.editor.getText().split("\n")[cursor.line] ?? "") : "";
 				const characterBeforeCursor = cursor && cursor.col > 0 ? currentLine[cursor.col - 1] : "";
@@ -3290,7 +3302,7 @@ export class InteractiveMode {
 
 			const image = await readClipboardImage();
 			if (image) {
-				if (!this.isBashMode) {
+				if (!this.isBashMode && this.mediaUxEnabled()) {
 					await this.composer.stage(
 						this.session.media,
 						{
