@@ -77,7 +77,8 @@ export class MediaRow implements Component {
 		const scope =
 			this.resolvedReference?.inspectionId ??
 			(this.source.type === "media_reference" ? this.source.inspectionId : undefined);
-		return `${this.source.kind} ${short} ${size} ${duration} ${this.asset?.availability === "missing" ? "Missing" : ""} ${scope ? (this.finished ? "Finished" : `Inspecting ${scope}`) : ""}`.trim();
+		const metadata = this.asset?.metadataError ? "Metadata unavailable" : "";
+		return `${this.source.kind} ${short} ${size} ${duration} ${this.asset?.availability === "missing" ? "Missing" : ""} ${metadata} ${scope ? (this.finished ? "Finished" : `Inspecting ${scope}`) : ""}`.trim();
 	}
 	setExpanded(expanded: boolean): void {
 		this.expanded = expanded;
@@ -271,6 +272,7 @@ export class MediaRow implements Component {
 				width,
 			),
 		);
+		if (this.asset?.metadataError) lines.push(truncateToWidth(theme.fg("warning", this.asset.metadataError), width));
 		if (this.error) lines.push(truncateToWidth(theme.fg("error", this.error), width));
 		else if (this.pending) lines.push(truncateToWidth(theme.fg("dim", "Preparing…"), width));
 		if (
