@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, rename } from "node:fs/promises";
+import { mkdir, open, readFile, rename } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { AgentContent, AgentMessage } from "@earendil-works/pi-agent-core";
-import { type FileEntry, loadEntriesFromFile, type SessionEntry, type SessionManager } from "../session-manager.ts";
+import { CURRENT_SESSION_VERSION, type FileEntry, type SessionEntry, type SessionManager } from "../session-manager.ts";
 import { MEDIA_ADMISSION_ENTRY } from "./failures.ts";
 import { MEDIA_POLICY_ENTRY } from "./policy.ts";
 import {
@@ -173,9 +173,24 @@ export async function externalizeLegacySession(
 	cwd: string,
 	signal: AbortSignal = new AbortController().signal,
 ): Promise<string> {
-	const entries = loadEntriesFromFile(source),
-		header = entries[0];
+	// Import is an authoritative copy, not the tolerant history-collection loader.
+	// Validate every physical line before capture and never repair the live source.
+	const entries: FileEntry[] = [];
+	const lines = (await readFile(source, "utf8")).split("\n");
+	for (const [index, line] of lines.entries()) {
+		if (!line.trim()) continue;
+		try {
+			entries.push(JSON.parse(line) as FileEntry);
+		} catch (error) {
+			throw new Error(`Malformed session JSON at ${source}:${index + 1}`, { cause: error });
+		}
+	}
+	const header = entries[0];
 	if (header?.type !== "session") throw new Error("Legacy session has no header");
+	const version = header.version ?? 1;
+	if (version > CURRENT_SESSION_VERSION) throw new Error(`Unsupported session schema ${version}`);
+	if (header.requiredMediaContract && header.requiredMediaContract !== MEDIA_CONTRACT)
+		throw new Error("Unsupported session media contract");
 	const ids = new Set<string>(),
 		calls = new Set<string>();
 	for (const entry of entries) {
