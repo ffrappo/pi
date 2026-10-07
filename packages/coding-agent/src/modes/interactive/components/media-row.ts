@@ -27,6 +27,7 @@ export interface MediaRowOptions {
 export class MediaRow implements Component {
 	readonly source: MediaRowSource;
 	private resolvedReference?: MediaReferenceContent;
+	private finished = false;
 	private registration?: Promise<MediaReferenceContent>;
 	private options: MediaRowOptions;
 	private asset?: MediaAsset;
@@ -73,7 +74,10 @@ export class MediaRow implements Component {
 		const short = this.source.assetId.slice(7, 15);
 		const size = this.asset ? `${Math.ceil(this.asset.byteSize / 1024)} KiB` : "";
 		const duration = this.asset?.durationSeconds === undefined ? "" : `${this.asset.durationSeconds.toFixed(1)}s`;
-		return `${this.source.kind} ${short} ${size} ${duration} ${this.asset?.availability === "missing" ? "Missing" : ""}`.trim();
+		const scope =
+			this.resolvedReference?.inspectionId ??
+			(this.source.type === "media_reference" ? this.source.inspectionId : undefined);
+		return `${this.source.kind} ${short} ${size} ${duration} ${this.asset?.availability === "missing" ? "Missing" : ""} ${scope ? (this.finished ? "Finished" : `Inspecting ${scope}`) : ""}`.trim();
 	}
 	setExpanded(expanded: boolean): void {
 		this.expanded = expanded;
@@ -226,11 +230,13 @@ export class MediaRow implements Component {
 			if (!this.options.media) throw new Error("Media service unavailable");
 			const ref = await this.reference();
 			if (action === "open") await this.options.media.open(ref);
-			else if (action === "inspect")
+			else if (action === "inspect") {
 				this.resolvedReference = await this.options.media.inspect(ref, { reason: "User selected Inspect" });
-			else {
-				if (!ref.inspectionId) throw new Error("No active inspection on this row");
+				this.finished = false;
+			} else {
+				if (!ref.inspectionId || this.finished) throw new Error("No active inspection on this row");
 				await this.options.media.finish(ref.inspectionId, "User selected Finish");
+				this.finished = true;
 			}
 		} catch (error) {
 			this.error = error instanceof Error ? error.message : String(error);

@@ -3192,15 +3192,29 @@ export class InteractiveMode {
 			}
 			if (action) {
 				const id = parts[2];
-				const refs = [...this.session.media.list(), ...this.composer.selected()].filter(
-					(ref) => id && (ref.assetId === id || ref.assetId.slice(7).startsWith(id)),
-				);
-				if (refs.length !== 1) throw new Error("Select one exact media ID");
+				const all = [...this.session.media.list(), ...this.composer.selected()];
+				if (action === "finish") {
+					const active = all.filter(
+						(ref) =>
+							ref.inspectionId &&
+							(ref.inspectionId === id ||
+								ref.blockId === id ||
+								ref.assetId === id ||
+								(id && ref.assetId.slice(7).startsWith(id))),
+					);
+					const scopes = [...new Set(active.map((ref) => ref.inspectionId!))];
+					if (scopes.length !== 1) throw new Error("Select an exact active inspection ID or block ID");
+					await this.session.media.finish(scopes[0], "User /media finish");
+					this.showStatus(`Finished ${scopes[0]}`);
+					return;
+				}
+				const refs = all.filter((ref) => id && (ref.assetId === id || ref.assetId.slice(7).startsWith(id)));
+				if (new Set(refs.map((ref) => ref.assetId)).size !== 1) throw new Error("Select one exact media asset ID");
 				if (action === "open") await this.session.media.open(refs[0]);
-				else if (action === "inspect") await this.session.media.inspect(refs[0], { reason: "User /media inspect" });
-				else if (action === "finish" && refs[0].inspectionId)
-					await this.session.media.finish(refs[0].inspectionId, "User /media finish");
-				else
+				else if (action === "inspect") {
+					const ref = await this.session.media.inspect(refs[0], { reason: "User /media inspect" });
+					this.showStatus(`Inspecting ${ref.inspectionId ?? ref.blockId}`);
+				} else
 					throw new Error(
 						"Use /media, /media open|inspect|finish <id>, /media staged <index> inspect|view|remove, or /attach <file>",
 					);
