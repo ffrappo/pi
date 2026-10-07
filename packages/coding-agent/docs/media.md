@@ -37,7 +37,7 @@ Native and boundary-draft compaction use the same `SessionManager.appendCompacti
 
 Ordinary JSONL exports retain references and required contract. HTML renders reference descriptors and labels unresolved originals; it never uploads local media. Legacy image rasters load only when their `<details>` expands.
 
-`exportMediaBundle(manager, service, directory, signal?)` explicitly includes verified originals in a staged private project store, checks full digests, preserves entry/block/inspection IDs and policy, then publishes one bundle. Failed stages are retained and named in the error. `externalizeLegacySession(source,destination,service,cwd,signal?)` converts a copied session, validates entry/tool identity and never rewrites the live source. The service owns relocation/store binding.
+`exportMediaBundle(manager, service, directory, signal?)` explicitly includes verified originals in a staged private project store, checks full digests, preserves entry/block/inspection IDs and policy, then publishes one bundle. Failed stages are retained and named in the error. `externalizeLegacySession(source,destination,service,cwd,signal?)` converts a copied session, validates every physical JSON line, schema/contract and entry/tool identity, and never rewrites the live source. Malformed or truncated JSON fails before capture or output publication; valid input without a final newline remains unchanged. The service owns relocation/store binding.
 
 ## Acceptance scope
 
