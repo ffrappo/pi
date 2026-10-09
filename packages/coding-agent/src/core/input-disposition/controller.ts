@@ -1,7 +1,4 @@
-/**
- * Input disposition state machine for Pi v1.1.0 (single-flight admission,
- * generation guards, held custody, replacement reservation, idle pickup).
- */
+/** Input disposition state machine. */
 
 import { randomUUID } from "node:crypto";
 import type { ImageContent } from "@earendil-works/pi-ai";
@@ -49,13 +46,11 @@ export class InputDispositionController {
 		this._reportError = reportError;
 		this._currentGeneration = randomUUID();
 	}
-
 	dispose(): void {
 		this.bumpGeneration("session_replaced");
 		this._disposed = true;
 		if (this._idleTimer) clearTimeout(this._idleTimer);
 	}
-
 	recover(): void {
 		for (const occ of recoverInputOccurrences(this._recorder.sessionManager, this._currentGeneration)) {
 			if (this._occurrences.has(occ.occurrenceId)) continue;
@@ -64,11 +59,9 @@ export class InputDispositionController {
 			this._recorder.emit(occ);
 		}
 	}
-
 	get enabled(): boolean {
 		return this._enabled;
 	}
-
 	setEnabled(enabled: boolean): void {
 		if (this._enabled === enabled) return;
 		this._enabled = enabled;
@@ -77,17 +70,15 @@ export class InputDispositionController {
 			this.bumpGeneration("mode_off");
 		}
 	}
-
 	get currentGeneration(): string {
 		return this._currentGeneration;
 	}
-
 	bumpGeneration(reason?: string): void {
 		this._currentGeneration = randomUUID();
 		this._pending.clear();
 		this._deferredIdleEvalScheduled = false;
 		this._reservedReplacementOccurrenceId = undefined;
-		// Invalidate all pending admissions waiting or in-flight
+		// Invalidate pending admissions.
 		if (this._inFlightAdmission) {
 			this._inFlightAdmission.invalidated = true;
 			this._inFlightAdmission.resolveGate("invalidated");
@@ -114,40 +105,31 @@ export class InputDispositionController {
 			}
 		}
 	}
-
 	nextOccurrenceId(): string {
 		return `occ_${randomUUID()}`;
 	}
-
 	nextRunId(): string {
 		return `run_${randomUUID()}`;
 	}
-
 	occurrences(): IterableIterator<AdmittedOccurrence> {
 		return this._occurrences.values();
 	}
-
 	notifyRunStart(runId: string): void {
 		this._activeRunId = runId;
 	}
-
 	notifyRunSettled(): void {
 		this._activeRunId = undefined;
 		this._scheduleDeferredIdleEvaluationIfDue();
 	}
-
 	get activeRunId(): string | undefined {
 		return this._activeRunId;
 	}
-
 	get pendingAdmissionCount(): number {
 		return this._pending.size + (this._reservedReplacementOccurrenceId ? 1 : 0);
 	}
-
 	isAdmissionFull(): boolean {
 		return this.pendingAdmissionCount >= MAX_PENDING_AUTOMATIC_ADMISSIONS;
 	}
-
 	admitOccurrence(options: {
 		text: string;
 		images?: ImageContent[];
@@ -175,9 +157,7 @@ export class InputDispositionController {
 			this._occurrences.set(occurrenceId, fullOccurrence);
 			this._recorder.persist(fullOccurrence, "occurrence", options.text);
 			this._recorder.emit(fullOccurrence);
-			// Overflow stays actionable in-session: held custody carries the admission-full
-			// fact so the owner can release it here instead of restarting. It never counts
-			// as a pending admission and is never dispatched automatically.
+			// Overflow remains held for owner release without counting as pending.
 			this.holdInput(occurrenceId, options.text, options.images);
 			this.transition(occurrenceId, "held", {
 				detail: "admission_full: pending limit reached; owner release required",
@@ -205,7 +185,6 @@ export class InputDispositionController {
 		this._recorder.emit(occurrence);
 		return { occurrence, isFull: false };
 	}
-
 	async beginInputDisposition(occurrenceId: string): Promise<"granted" | "invalidated"> {
 		const occurrence = this._occurrences.get(occurrenceId);
 		if (!occurrence || occurrence.sessionGeneration !== this._currentGeneration) {
@@ -232,7 +211,6 @@ export class InputDispositionController {
 			});
 		});
 	}
-
 	finishInputDisposition(occurrenceId: string): void {
 		this._pending.delete(occurrenceId);
 		if (this._inFlightAdmission && this._inFlightAdmission.occurrenceId === occurrenceId) {
@@ -246,7 +224,6 @@ export class InputDispositionController {
 		}
 		this._scheduleDeferredIdleEvaluationIfDue();
 	}
-
 	private _drainNextAdmission(): void {
 		while (this._admissionWaitQueue.length > 0) {
 			const next = this._admissionWaitQueue.shift();
@@ -261,7 +238,6 @@ export class InputDispositionController {
 			return;
 		}
 	}
-
 	invalidateInFlightDueToInterrupt(): void {
 		if (this._inFlightAdmission) {
 			const occ = this._occurrences.get(this._inFlightAdmission.occurrenceId);
@@ -287,7 +263,6 @@ export class InputDispositionController {
 			}
 		}
 	}
-
 	holdInput(occurrenceId: string, text: string, images?: ImageContent[]): void {
 		this._heldInputs.set(occurrenceId, {
 			occurrenceId,
@@ -298,33 +273,25 @@ export class InputDispositionController {
 			createdAt: Date.now(),
 		});
 	}
-
 	getHeldInput(occurrenceId: string): HeldSteeringInput | undefined {
 		return this._heldInputs.get(occurrenceId);
 	}
-
 	takeHeldInput(occurrenceId: string): HeldSteeringInput | undefined {
 		const val = this._heldInputs.get(occurrenceId);
 		if (val) this._heldInputs.delete(occurrenceId);
 		return val;
 	}
-
 	getHeldInputs(): readonly HeldSteeringInput[] {
 		return Array.from(this._heldInputs.values());
 	}
-
 	reserveReplacement(occurrenceId: string): void {
 		this._reservedReplacementOccurrenceId = occurrenceId;
 	}
-
 	get reservedReplacementOccurrenceId(): string | undefined {
 		return this._reservedReplacementOccurrenceId;
 	}
-
 	clearReservedReplacement(occurrenceId?: string): void {
-		// Bound clearing: a stale or superseded operation must not clear a newer
-		// replacement's reservation; only the owner (or an unqualified reset)
-		// releases the slot.
+		// Clear only the reservation owner (or an unqualified reset).
 		if (occurrenceId !== undefined && this._reservedReplacementOccurrenceId !== occurrenceId) return;
 		this._reservedReplacementOccurrenceId = undefined;
 	}
@@ -336,11 +303,9 @@ export class InputDispositionController {
 		if (update.disposition) occ.disposition = update.disposition;
 		occ.capturedRunId = update.capturedRunId;
 	}
-
 	getOccurrence(occurrenceId: string): AdmittedOccurrence | undefined {
 		return this._occurrences.get(occurrenceId);
 	}
-
 	transition(
 		occurrenceId: string,
 		state: InputDispositionState,
@@ -363,7 +328,6 @@ export class InputDispositionController {
 		this._recorder.emit(occurrence, options?.queue, options?.queuePosition);
 		return occurrence;
 	}
-
 	getQueuedInput(): QueuedInputRef[] {
 		const refs: QueuedInputRef[] = [];
 		let steerPos = 1;
@@ -373,7 +337,7 @@ export class InputDispositionController {
 		for (const occ of this._occurrences.values()) {
 			if (occ.sessionGeneration !== this._currentGeneration) continue;
 			if (occ.state === "queued") {
-				// The explicit disposition is authoritative once set; streamingBehavior is only the pre-claim default.
+				// The explicit disposition wins after a claim.
 				const effective = occ.disposition ?? (occ.streamingBehavior === "followUp" ? "follow_up" : "steer");
 				if (effective === "steer") {
 					refs.push({ occurrenceId: occ.occurrenceId, queue: "steer", position: steerPos++ });
@@ -389,34 +353,29 @@ export class InputDispositionController {
 
 		return refs;
 	}
-
 	scheduleDeferredIdleEvaluation(): void {
 		this._deferredIdleEvalScheduled = true;
 		if (!this._activeRunId && this.pendingAdmissionCount === 0) {
 			this._scheduleDeferredIdleEvaluationIfDue();
 		}
 	}
-
 	private _scheduleDeferredIdleEvaluationIfDue(): void {
 		if (!this._deferredIdleEvalScheduled) return;
 		if (this._disposed || this._activeRunId || this.pendingAdmissionCount > 0) return;
 
 		this._deferredIdleEvalScheduled = false;
-		// Run from next event loop tick so any synchronous caller or settling finishes first
+		// Next tick permits synchronous settlement to finish.
 		this._idleTimer = setTimeout(() => {
 			if (!this._disposed && !this._activeRunId && this.pendingAdmissionCount === 0) {
 				void this._executeIdleWorkEvaluation()
 					.then((res) => {
 						if (!res.started && res.reason === "input_pending") {
-							// Chained re-arm if another admission appeared right before run
+							// Re-arm if another admission arrived before this evaluation.
 							this._deferredIdleEvalScheduled = true;
 						}
 					})
 					.catch((error) => {
-						// A damaged custody owner or failing idle evaluation must stay visible:
-						// route through the session's real error channel, never a bare console
-						// line and never a blind retry. The next settle or admission event may
-						// schedule a fresh evaluation; this failure itself is terminal here.
+						// Report terminal idle-evaluation errors. A later event may schedule a fresh evaluation.
 						this._reportError(error);
 					});
 			} else if (!this._disposed) this._deferredIdleEvalScheduled = true;

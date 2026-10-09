@@ -335,7 +335,9 @@ export interface PromptOptions {
 	ingress?: "automatic" | "explicit";
 	/** Explicit owner delivery choice, bypassing automatic classification. */
 	disposition?: InputDisposition;
-	/** Internal hook used by RPC mode to observe how an accepted prompt was dispatched. Not called if the prompt is rejected. */
+	/** Internal hook used by RPC mode to observe how an accepted prompt was dispatched. Not called if the prompt is rejected.
+	 * Fired once where the dispatch actually occurs (held decision, queue time, run-start boundary); a backend failure after
+	 * run start does not re-fire it. */
 	preflightResult?: (disposition: PromptDisposition) => void;
 }
 
@@ -2145,13 +2147,15 @@ export class AgentSession {
 			const requestedDisposition = processedInput.claim?.disposition ?? options?.disposition;
 			if (requestedDisposition && dispositionOccurrence) {
 				// Declarative claim: the owning dispatcher executes it once; input hooks do not
-				// re-run. The preflight disposition is the dispatcher's actual outcome (held
-				// conflict, queued, or started run), reported once after it resolves.
-				const outcome = await this._executeClaimedDisposition(
+				// re-run. The preflight disposition is the dispatcher's actual one-shot outcome,
+				// reported where the operation occurs: held at the hold decision, queued at queue
+				// time, started at the run-start boundary before generation finishes. A backend
+				// failure after run start is not a second report; the original error propagates.
+				await this._executeClaimedDisposition(
 					{ ...dispositionOccurrence, text: currentText, images: currentImages },
 					requestedDisposition,
+					preflightResult,
 				);
-				preflightResult?.(outcome);
 				return;
 			}
 
@@ -2414,11 +2418,14 @@ export class AgentSession {
 	/**
 	 * Execute one claimed disposition exactly once against the original occurrence.
 	 * Returns the actual dispatcher outcome so callers and RPC observers report what
-	 * really happened instead of a constant.
+	 * really happened instead of a constant. `report` fires exactly once where the
+	 * operation occurs: held at the hold decision, queued at queue time, started at
+	 * the run-start boundary; a later failure never re-fires it.
 	 */
 	private async _executeClaimedDisposition(
 		occ: AdmittedOccurrence,
 		disposition: InputDisposition,
+		report?: (outcome: QueuedInputDisposition) => void,
 	): Promise<QueuedInputDisposition> {
 		if (
 			occ.sessionGeneration !== this._inputDispositionController.currentGeneration ||
@@ -2436,10 +2443,11 @@ export class AgentSession {
 							disposition,
 							detail: "conflict: a run is active",
 						});
+						report?.("held");
 						return "held";
 					}
 					this._inputDispositionController.transition(occ.occurrenceId, "dispatched", { disposition });
-					await this._dispatchAdmittedOccurrence(occ);
+					await this._dispatchAdmittedOccurrence(occ, report);
 					return "started";
 				}
 				case "steer":
@@ -2452,6 +2460,7 @@ export class AgentSession {
 							disposition,
 							detail: "conflict: captured run ended",
 						});
+						report?.("held");
 						return "held";
 					}
 					if ((this.isStreaming || this._isAgentRunActive) && capturedRunValid) {
@@ -2467,6 +2476,7 @@ export class AgentSession {
 						} else {
 							await this._queueFollowUp(expandedText, occ.images, occ.occurrenceId);
 						}
+						report?.("queued");
 						return "queued";
 					}
 					// Idle or captured run already ended naturally: normalize through native queue
@@ -2476,11 +2486,15 @@ export class AgentSession {
 					if (disposition === "steer") await this._queueSteer(normalizedText, occ.images, occ.occurrenceId);
 					else await this._queueFollowUp(normalizedText, occ.images, occ.occurrenceId);
 					this._inputDispositionController.finishInputDisposition(occ.occurrenceId);
-					await this._runAgentLoop(() => this.agent.continue());
+					await this._runAgentLoop(async () => {
+						// Run-start boundary: the loop owns the run from this callback onward.
+						report?.("started");
+						await this.agent.continue();
+					});
 					return "started";
 				}
 				case "interrupt_now": {
-					return await this._executeInterruptNow(occ);
+					return await this._executeInterruptNow(occ, report);
 				}
 			}
 		} catch (err) {
@@ -2523,7 +2537,10 @@ export class AgentSession {
 	}
 
 	/** interrupt_now: durable replacement record, abort, await real idle, revalidate, dispatch the same replacement once. */
-	private async _executeInterruptNow(occ: AdmittedOccurrence): Promise<QueuedInputDisposition> {
+	private async _executeInterruptNow(
+		occ: AdmittedOccurrence,
+		report?: (outcome: QueuedInputDisposition) => void,
+	): Promise<QueuedInputDisposition> {
 		if (
 			(this._isAgentRunActive || this.isStreaming) &&
 			occ.capturedRunId !== this._inputDispositionController.activeRunId
@@ -2533,11 +2550,12 @@ export class AgentSession {
 				disposition: "interrupt_now",
 				detail: "conflict: stale run",
 			});
+			report?.("held");
 			return "held";
 		}
 		this._inputDispositionController.reserveReplacement(occ.occurrenceId);
 		try {
-			return await this._executeInterruptNowReserved(occ);
+			return await this._executeInterruptNowReserved(occ, report);
 		} catch (error) {
 			// A throwing abort or custody error must not leak the reservation: it
 			// would count as pending admission and block idle work evaluation.
@@ -2547,7 +2565,10 @@ export class AgentSession {
 		}
 	}
 
-	private async _executeInterruptNowReserved(occ: AdmittedOccurrence): Promise<QueuedInputDisposition> {
+	private async _executeInterruptNowReserved(
+		occ: AdmittedOccurrence,
+		report?: (outcome: QueuedInputDisposition) => void,
+	): Promise<QueuedInputDisposition> {
 		if (occ.ingress === "explicit") this._inputDispositionController.invalidateInFlightDueToInterrupt();
 		this._inputDispositionController.transition(occ.occurrenceId, "cancel_requested", {
 			disposition: "interrupt_now",
@@ -2603,6 +2624,7 @@ export class AgentSession {
 				detail: "conflict: stale generation",
 			});
 			this._inputDispositionController.clearReservedReplacement(occ.occurrenceId);
+			report?.("held");
 			return "held";
 		}
 		if (this.isStreaming || this._isAgentRunActive) {
@@ -2613,6 +2635,7 @@ export class AgentSession {
 				detail: "conflict: newer run active",
 			});
 			this._inputDispositionController.clearReservedReplacement(occ.occurrenceId);
+			report?.("held");
 			return "held";
 		}
 
@@ -2620,7 +2643,7 @@ export class AgentSession {
 			disposition: "interrupt_now",
 		});
 		try {
-			await this._dispatchAdmittedOccurrence(occ);
+			await this._dispatchAdmittedOccurrence(occ, report);
 		} finally {
 			this._inputDispositionController.clearReservedReplacement(occ.occurrenceId);
 		}
@@ -2628,7 +2651,10 @@ export class AgentSession {
 	}
 
 	/** Dispatch one admitted occurrence through the normal pipeline: expansion and provider admission, no input hook re-run. */
-	private async _dispatchAdmittedOccurrence(occ: AdmittedOccurrence): Promise<void> {
+	private async _dispatchAdmittedOccurrence(
+		occ: AdmittedOccurrence,
+		report?: (outcome: QueuedInputDisposition) => void,
+	): Promise<void> {
 		let expandedText = this._expandSkillCommand(occ.text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 		await this._runPromptPipeline(
@@ -2637,6 +2663,8 @@ export class AgentSession {
 			() => {
 				this._inputDispositionController.finishInputDisposition(occ.occurrenceId);
 				this._inputDispositionController.clearReservedReplacement(occ.occurrenceId);
+				// Run-start boundary: provider admission checks passed; the run begins now.
+				report?.("started");
 			},
 			occ.occurrenceId,
 		);
