@@ -2347,10 +2347,14 @@ export class AgentSession {
 		const held = this._inputDispositionController.getHeldInput(occurrenceId);
 		const occ = this._inputDispositionController.getOccurrence(occurrenceId);
 		if (!held || !occ || occ.revision !== expectedRevision || occ.state !== "held") return "rejected";
+		// A rejected release must not strip actionability: retained custody stays
+		// held (visible in queue readback, copyable, re-releasable) and the refusal
+		// is recorded as a factual detail. Transitioning to blocked/failed here
+		// would orphan the retained text outside getQueuedInput forever.
 		if (occ.sessionGeneration !== this._inputDispositionController.currentGeneration) {
-			this._inputDispositionController.transition(occurrenceId, "blocked", {
+			this._inputDispositionController.transition(occurrenceId, "held", {
 				disposition,
-				detail: "stale_generation",
+				detail: "release rejected: stale generation",
 			});
 			return "rejected";
 		}
@@ -2358,13 +2362,16 @@ export class AgentSession {
 			held.sessionId !== this.sessionManager.getSessionId() ||
 			held.sessionGeneration !== this._inputDispositionController.currentGeneration
 		) {
-			this._inputDispositionController.transition(occurrenceId, "blocked", { disposition, detail: "stale_session" });
+			this._inputDispositionController.transition(occurrenceId, "held", {
+				disposition,
+				detail: "release rejected: stale session",
+			});
 			return "rejected";
 		}
 		if (disposition === "interrupt_now") {
-			this._inputDispositionController.transition(occurrenceId, "blocked", {
+			this._inputDispositionController.transition(occurrenceId, "held", {
 				disposition,
-				detail: "interrupt_not_releasable",
+				detail: "release rejected: interrupt release is not available",
 			});
 			return "rejected";
 		}
@@ -2389,11 +2396,12 @@ export class AgentSession {
 			switch (disposition) {
 				case "send_now": {
 					if (this.isStreaming || this._isAgentRunActive) {
-						// Idle send-now becoming busy: visible conflict, text retained, no second run.
+						// Idle send-now becoming busy: retained custody stays held and
+						// re-dispositionable; no second run and no silent drop.
 						this._inputDispositionController.holdInput(occ.occurrenceId, occ.text, occ.images);
-						this._inputDispositionController.transition(occ.occurrenceId, "conflict", {
+						this._inputDispositionController.transition(occ.occurrenceId, "held", {
 							disposition,
-							detail: "run_active",
+							detail: "conflict: a run is active",
 						});
 						return;
 					}
@@ -2407,9 +2415,9 @@ export class AgentSession {
 						occ.capturedRunId !== undefined && occ.capturedRunId === this._inputDispositionController.activeRunId;
 					if ((this.isStreaming || this._isAgentRunActive) && !capturedRunValid) {
 						this._inputDispositionController.holdInput(occ.occurrenceId, occ.text, occ.images);
-						this._inputDispositionController.transition(occ.occurrenceId, "conflict", {
+						this._inputDispositionController.transition(occ.occurrenceId, "held", {
 							disposition,
-							detail: "stale_run",
+							detail: "conflict: captured run ended",
 						});
 						return;
 					}
@@ -2454,10 +2462,12 @@ export class AgentSession {
 				error: `Disposition ${disposition} for ${occ.occurrenceId} failed in state ${current?.state ?? "unknown"}: ${err instanceof Error ? err.message : String(err)}`,
 			});
 			if (!advanced) {
+				// Retained custody stays held with the failure as detail so it remains
+				// visible in queue readback and releasable; never orphaned as failed.
 				this._inputDispositionController.holdInput(occ.occurrenceId, occ.text, occ.images);
-				this._inputDispositionController.transition(occ.occurrenceId, "failed", {
+				this._inputDispositionController.transition(occ.occurrenceId, "held", {
 					disposition,
-					detail: err instanceof Error ? err.message : String(err),
+					detail: `dispatch failed: ${err instanceof Error ? err.message : String(err)}`,
 				});
 			}
 			throw err;
@@ -2471,10 +2481,24 @@ export class AgentSession {
 			occ.capturedRunId !== this._inputDispositionController.activeRunId
 		) {
 			this._inputDispositionController.holdInput(occ.occurrenceId, occ.text, occ.images);
-			this._inputDispositionController.transition(occ.occurrenceId, "conflict", { detail: "stale_run" });
+			this._inputDispositionController.transition(occ.occurrenceId, "held", {
+				disposition: "interrupt_now",
+				detail: "conflict: stale run",
+			});
 			return;
 		}
 		this._inputDispositionController.reserveReplacement(occ.occurrenceId);
+		try {
+			await this._executeInterruptNowReserved(occ);
+		} catch (error) {
+			// A throwing abort or custody error must not leak the reservation: it
+			// would count as pending admission and block idle work evaluation.
+			this._inputDispositionController.clearReservedReplacement();
+			throw error;
+		}
+	}
+
+	private async _executeInterruptNowReserved(occ: AdmittedOccurrence): Promise<void> {
 		if (occ.ingress === "explicit") this._inputDispositionController.invalidateInFlightDueToInterrupt();
 		this._inputDispositionController.transition(occ.occurrenceId, "cancel_requested", {
 			disposition: "interrupt_now",
@@ -2525,14 +2549,20 @@ export class AgentSession {
 			occ.sessionGeneration !== this._inputDispositionController.currentGeneration
 		) {
 			this._inputDispositionController.holdInput(occ.occurrenceId, occ.text, occ.images);
-			this._inputDispositionController.transition(occ.occurrenceId, "conflict", { detail: "stale_generation" });
+			this._inputDispositionController.transition(occ.occurrenceId, "held", {
+				disposition: "interrupt_now",
+				detail: "conflict: stale generation",
+			});
 			this._inputDispositionController.clearReservedReplacement();
 			return;
 		}
 		if (this.isStreaming || this._isAgentRunActive) {
-			// A newer run started meanwhile: never abort it; resolve to held conflict.
+			// A newer run started meanwhile: never abort it; retained custody stays held.
 			this._inputDispositionController.holdInput(occ.occurrenceId, occ.text, occ.images);
-			this._inputDispositionController.transition(occ.occurrenceId, "conflict", { detail: "newer_run_active" });
+			this._inputDispositionController.transition(occ.occurrenceId, "held", {
+				disposition: "interrupt_now",
+				detail: "conflict: newer run active",
+			});
 			this._inputDispositionController.clearReservedReplacement();
 			return;
 		}
