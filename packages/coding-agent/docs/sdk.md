@@ -13,7 +13,7 @@ try {
   await session.prompt("What files are in the current directory?");
   console.log(session.getLastAssistantText());
 } finally {
-  session.dispose();
+  await session.dispose();
 }
 ```
 
@@ -53,7 +53,7 @@ See the checked [sessions example](../examples/sdk/11-sessions.ts) for creating,
 
 `cwd` selects the workspace used for project resource discovery, context files, session grouping, and built-in tool paths. Pass it explicitly when the target differs from `process.cwd()`.
 
-`session.dispose()` aborts active work, invalidates extension contexts, disconnects from the agent, and removes event listeners. Call it when the session is no longer needed.
+`await session.dispose()` aborts active work, waits for extension shutdown handlers, then invalidates contexts, disconnects from the agent, and removes event listeners. Await it before replacing a session so extension-owned timers and listeners finish cleanup. Shutdown is emitted once per extension runtime.
 
 `AgentSessionRuntime` adds `newSession()`, `switchSession()`, `fork()`, and `importFromJsonl()`. Each operation replaces the active `AgentSession` and recreates services for the target working directory.
 

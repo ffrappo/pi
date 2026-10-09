@@ -379,7 +379,11 @@ export interface ExtensionContext {
 	/** Awaited idle work pickup: runs the normal before-settle work-queue evaluation once when idle. Refuses while busy, admission pending, or settling; native then schedules exactly one deferred evaluation after the blocker clears. */
 	evaluateIdleWork?(): Promise<EvaluateIdleWorkResult>;
 	/** Explicitly release a held input with the given disposition. Rejected for stale session/generation or unknown ids. */
-	releaseHeldInput?(occurrenceId: string, disposition: InputDisposition): Promise<"released" | "rejected">;
+	releaseHeldInput?(
+		occurrenceId: string,
+		disposition: InputDisposition,
+		expectedRevision: number,
+	): Promise<"released" | "rejected">;
 	/** Explicit owner delivery of new text: reserves and dispatches without automatic classification. */
 	dispatchInput?(text: string, disposition: InputDisposition): Promise<void>;
 	/** Gracefully shutdown pi and exit. Available in all contexts. */
@@ -2283,7 +2287,11 @@ export interface InputDispositionContextActions {
 	getDisposition: (occurrenceId: string) => InputDispositionEvent | undefined;
 	getQueuedInput: () => QueuedInputRef[];
 	evaluateIdleWork: () => Promise<EvaluateIdleWorkResult>;
-	releaseHeldInput: (occurrenceId: string, disposition: InputDisposition) => Promise<"released" | "rejected">;
+	releaseHeldInput: (
+		occurrenceId: string,
+		disposition: InputDisposition,
+		expectedRevision: number,
+	) => Promise<"released" | "rejected">;
 	dispatchInput: (text: string, disposition: InputDisposition) => Promise<void>;
 }
 

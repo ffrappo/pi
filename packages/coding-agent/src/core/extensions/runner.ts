@@ -258,15 +258,22 @@ export type ShutdownHandler = () => void;
  * Helper function to emit session_shutdown event to extensions.
  * Returns true if the event was emitted, false if there were no handlers.
  */
-export async function emitSessionShutdownEvent(
+const shutdowns = new WeakMap<ExtensionRunner, Promise<boolean>>();
+
+export function emitSessionShutdownEvent(
 	extensionRunner: ExtensionRunner,
 	event: SessionShutdownEvent,
 ): Promise<boolean> {
-	if (extensionRunner.hasHandlers("session_shutdown")) {
-		await extensionRunner.emit(event);
-		return true;
+	let shutdown = shutdowns.get(extensionRunner);
+	if (!shutdown) {
+		shutdown = Promise.resolve().then(async () => {
+			if (!extensionRunner.hasHandlers("session_shutdown")) return false;
+			await extensionRunner.emit(event);
+			return true;
+		});
+		shutdowns.set(extensionRunner, shutdown);
 	}
-	return false;
+	return shutdown;
 }
 
 function snapshotEventHandlers(extensions: Extension[], event: ExtensionEvent["type"]) {
@@ -978,9 +985,13 @@ export class ExtensionRunner {
 							runner.assertActive();
 							return runner.inputDispositionActions!.evaluateIdleWork();
 						},
-						releaseHeldInput: (occurrenceId: string, disposition: InputDisposition) => {
+						releaseHeldInput: (occurrenceId: string, disposition: InputDisposition, expectedRevision: number) => {
 							runner.assertActive();
-							return runner.inputDispositionActions!.releaseHeldInput(occurrenceId, disposition);
+							return runner.inputDispositionActions!.releaseHeldInput(
+								occurrenceId,
+								disposition,
+								expectedRevision,
+							);
 						},
 						dispatchInput: (text: string, disposition: InputDisposition) => {
 							runner.assertActive();
