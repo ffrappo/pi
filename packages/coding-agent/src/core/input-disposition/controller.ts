@@ -311,7 +311,11 @@ export class InputDispositionController {
 		return this._reservedReplacementOccurrenceId;
 	}
 
-	clearReservedReplacement(): void {
+	clearReservedReplacement(occurrenceId?: string): void {
+		// Bound clearing: a stale or superseded operation must not clear a newer
+		// replacement's reservation; only the owner (or an unqualified reset)
+		// releases the slot.
+		if (occurrenceId !== undefined && this._reservedReplacementOccurrenceId !== occurrenceId) return;
 		this._reservedReplacementOccurrenceId = undefined;
 	}
 

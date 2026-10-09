@@ -2474,6 +2474,42 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Explicit owner delivery of new text. With custody enabled it goes through
+	 * the disposition dispatcher (admission, held conflicts, readback). With
+	 * custody retired (setEnabled(false)) it still delivers through the native
+	 * legacy queues, so explicit controls never depend on the automatic gate:
+	 * send_now while busy refuses instead of silently downgrading to steer.
+	 */
+	private async _dispatchInputExplicit(text: string, disposition: InputDisposition): Promise<void> {
+		if (this._inputDispositionController.enabled) {
+			await this.prompt(text, {
+				ingress: "explicit",
+				disposition,
+				streamingBehavior: disposition === "follow_up" ? "followUp" : "steer",
+			});
+			return;
+		}
+		switch (disposition) {
+			case "steer":
+				await this.steer(text);
+				return;
+			case "follow_up":
+				await this.followUp(text);
+				return;
+			case "send_now":
+				if (this.isStreaming || this._isAgentRunActive) {
+					throw new Error("A run is active; send_now needs idle. Use /steer or /interrupt-now.");
+				}
+				await this.prompt(text);
+				return;
+			case "interrupt_now":
+				await this.abort();
+				await this.prompt(text);
+				return;
+		}
+	}
+
 	/** interrupt_now: durable replacement record, abort, await real idle, revalidate, dispatch the same replacement once. */
 	private async _executeInterruptNow(occ: AdmittedOccurrence): Promise<void> {
 		if (
@@ -2493,7 +2529,8 @@ export class AgentSession {
 		} catch (error) {
 			// A throwing abort or custody error must not leak the reservation: it
 			// would count as pending admission and block idle work evaluation.
-			this._inputDispositionController.clearReservedReplacement();
+			// Bound to this occurrence so a superseding reservation survives.
+			this._inputDispositionController.clearReservedReplacement(occ.occurrenceId);
 			throw error;
 		}
 	}
@@ -2553,7 +2590,7 @@ export class AgentSession {
 				disposition: "interrupt_now",
 				detail: "conflict: stale generation",
 			});
-			this._inputDispositionController.clearReservedReplacement();
+			this._inputDispositionController.clearReservedReplacement(occ.occurrenceId);
 			return;
 		}
 		if (this.isStreaming || this._isAgentRunActive) {
@@ -2563,7 +2600,7 @@ export class AgentSession {
 				disposition: "interrupt_now",
 				detail: "conflict: newer run active",
 			});
-			this._inputDispositionController.clearReservedReplacement();
+			this._inputDispositionController.clearReservedReplacement(occ.occurrenceId);
 			return;
 		}
 
@@ -2573,7 +2610,7 @@ export class AgentSession {
 		try {
 			await this._dispatchAdmittedOccurrence(occ);
 		} finally {
-			this._inputDispositionController.clearReservedReplacement();
+			this._inputDispositionController.clearReservedReplacement(occ.occurrenceId);
 		}
 	}
 
@@ -2586,7 +2623,7 @@ export class AgentSession {
 			occ.images,
 			() => {
 				this._inputDispositionController.finishInputDisposition(occ.occurrenceId);
-				this._inputDispositionController.clearReservedReplacement();
+				this._inputDispositionController.clearReservedReplacement(occ.occurrenceId);
 			},
 			occ.occurrenceId,
 		);
@@ -3966,11 +4003,7 @@ export class AgentSession {
 				requestIdleWorkEvaluation: () => this._evaluateIdleWork(),
 				getQueuedInput: () => this._inputDispositionController.getQueuedInput(),
 				dispatchInput: (text: string, disposition: InputDisposition) =>
-					this.prompt(text, {
-						ingress: "explicit",
-						disposition,
-						streamingBehavior: disposition === "follow_up" ? "followUp" : "steer",
-					}),
+					this._dispatchInputExplicit(text, disposition),
 			},
 			{
 				getModel: () => this.model,
@@ -4014,12 +4047,7 @@ export class AgentSession {
 					evaluateIdleWork: () => this._evaluateIdleWork(),
 					releaseHeldInput: (occurrenceId, disposition, expectedRevision) =>
 						this._releaseHeldInput(occurrenceId, disposition, expectedRevision),
-					dispatchInput: (text, disposition) =>
-						this.prompt(text, {
-							ingress: "explicit",
-							disposition,
-							streamingBehavior: disposition === "follow_up" ? "followUp" : "steer",
-						}),
+					dispatchInput: (text, disposition) => this._dispatchInputExplicit(text, disposition),
 				},
 			},
 			{
