@@ -2078,30 +2078,20 @@ export class AgentSession {
 		const ingress = options?.source && options.source !== "interactive" ? undefined : options?.ingress;
 		let dispositionOccurrence: AdmittedOccurrence | undefined;
 		let admissionFull = false;
-		let admissionError: unknown;
 		if (ingress && (this._inputDispositionController.enabled || ingress === "explicit")) {
-			try {
-				const admission = this._inputDispositionController.admitOccurrence({
-					text,
-					images: options?.images,
-					ingress,
-					streamingBehavior: this.isStreaming ? options?.streamingBehavior : undefined,
-				});
-				if (admission.isFull || !admission.occurrence) {
-					admissionFull = true;
-					dispositionOccurrence = admission.occurrence;
-				} else {
-					dispositionOccurrence = admission.occurrence;
-				}
-			} catch (error) {
-				admissionError = error;
-			}
-			if (admissionError) {
-				this._extensionRunner.emitError({
-					extensionPath: "<input-disposition>",
-					event: "input",
-					error: `Input custody failed; native delivery continues: ${admissionError instanceof Error ? admissionError.message : String(admissionError)}`,
-				});
+			// Custody is the owning precondition for native delivery: admission failure
+			// propagates so no hooks, queue work or model dispatch run without it.
+			const admission = this._inputDispositionController.admitOccurrence({
+				text,
+				images: options?.images,
+				ingress,
+				streamingBehavior: this.isStreaming ? options?.streamingBehavior : undefined,
+			});
+			if (admission.isFull || !admission.occurrence) {
+				admissionFull = true;
+				dispositionOccurrence = admission.occurrence;
+			} else {
+				dispositionOccurrence = admission.occurrence;
 			}
 		}
 		try {
