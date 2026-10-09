@@ -549,6 +549,11 @@ export class AgentSession {
 			includeAllExtensionTools: true,
 		});
 		if (this._initialActiveToolNames === undefined) this._restoreToolsFromTranscript();
+		// Recover durable input custody at session lifecycle, independent of automatic
+		// classification: restarts with the gate off must still expose held occurrences
+		// to readback and release instead of hiding them until an unrelated idle
+		// evaluation. Idempotent; later re-checks stay in _evaluateIdleWork only.
+		this._inputDispositionController.recover();
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -2976,10 +2981,12 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
-		// An explicit interrupt invalidates in-flight and queued automatic decisions;
-		// their undelivered inputs move to held custody and cannot revive. The dispatcher's
-		// own aborts are guarded so they do not invalidate their own admission.
-		if (this._inputDispositionController.enabled && !this._dispatcherBusy) {
+		// A user abort invalidates in-flight and queued admissions, automatic or
+		// explicit, gate on or off: the aborted input moves to held custody and cannot
+		// revive as a new run. With no custody pending this is a no-op with no journal
+		// writes. The dispatcher's own aborts are guarded so they do not invalidate
+		// their own replacement.
+		if (!this._dispatcherBusy) {
 			this._inputDispositionController.invalidateInFlightDueToInterrupt();
 		}
 		if (this._isAgentRunActive) {
