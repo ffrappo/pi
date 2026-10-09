@@ -1424,6 +1424,14 @@ export class AgentSession {
 	 */
 	dispose(): void {
 		this._inputDispositionController.dispose();
+		// Extensions own timers/listeners they start during the session; invalidate() alone
+		// leaves them ticking on a permanently stale ctx. Notify shutdown listeners first so
+		// their synchronous cleanup (unsubscribe, clearInterval) runs before invalidation.
+		void emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "quit" }).catch(
+			(error) => {
+				console.error("session_shutdown handler failed during dispose:", error);
+			},
+		);
 		try {
 			this.abortRetry();
 			this.abortCompaction();
