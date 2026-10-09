@@ -215,6 +215,19 @@ export {
 } from "./core/extensions/index.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
+// Input disposition
+export {
+	type AdmittedOccurrence,
+	type EvaluateIdleWorkResult,
+	INPUT_DISPOSITION_CUSTOM_TYPE,
+	INPUT_DISPOSITION_VERSION,
+	type InputDisposition,
+	type InputDispositionEvent,
+	type InputDispositionJournalEntry,
+	type InputDispositionState,
+	type InputIngress,
+	type QueuedInputRef,
+} from "./core/input-disposition.ts";
 export type { RegisteredMcpServer } from "./core/mcp-servers.ts";
 export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";

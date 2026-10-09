@@ -105,6 +105,7 @@ export type {
 	InlineExtension,
 	// Events - Input
 	InputEvent,
+	InputEventMetadata,
 	InputEventResult,
 	InputSource,
 	KeybindingsManager,

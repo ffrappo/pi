@@ -60,6 +60,20 @@ import type { BashResult } from "../bash-executor.ts";
 import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../cache-warmer.ts";
 import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
 import type { EventBus } from "../event-bus.ts";
+import type {
+	EvaluateIdleWorkResult,
+	InputDisposition,
+	InputDispositionEvent,
+	QueuedInputRef,
+} from "../input-disposition.ts";
+
+export type {
+	EvaluateIdleWorkResult,
+	InputDisposition,
+	InputDispositionEvent,
+	QueuedInputRef,
+} from "../input-disposition.ts";
+
 import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
@@ -354,6 +368,18 @@ export interface ExtensionContext {
 	abort(): void;
 	/** Whether there are queued messages waiting */
 	hasPendingMessages(): boolean;
+	/** Capability version for the native input disposition surface; undefined when unsupported. */
+	inputDispositionVersion?: number;
+	/** Single-flight admission gate for one automatic occurrence. Await before any classifier call. "invalidated" means an explicit interrupt superseded the decision; do not dispatch. */
+	beginInputDisposition?(occurrenceId: string): Promise<"granted" | "invalidated">;
+	/** Current disposition record for an occurrence, if any. */
+	getInputDisposition?(occurrenceId: string): InputDispositionEvent | undefined;
+	/** Live queue readback for queued/held/replacement inputs. */
+	getQueuedInput?(): QueuedInputRef[];
+	/** Awaited idle work pickup: runs the normal before-settle work-queue evaluation once when idle. Refuses while busy, admission pending, or settling; native then schedules exactly one deferred evaluation after the blocker clears. */
+	evaluateIdleWork?(): Promise<EvaluateIdleWorkResult>;
+	/** Explicitly release a held input with the given disposition. Rejected for stale session/generation or unknown ids. */
+	releaseHeldInput?(occurrenceId: string, disposition: InputDisposition): Promise<"released" | "rejected">;
 	/** Gracefully shutdown pi and exit. Available in all contexts. */
 	shutdown(): void;
 	/** Get current context usage for the active model. */
@@ -1150,13 +1176,34 @@ export interface InputEvent {
 	source: InputSource;
 	/** How the input will be delivered during streaming, or undefined when idle */
 	streamingBehavior?: "steer" | "followUp";
+	/** Host-assigned stable occurrence identity. Present only when input disposition mode is enabled. */
+	occurrenceId?: string;
+	/** Ingress classification. Absence means NO automatic classification, idle included. */
+	ingress?: "automatic" | "explicit";
+	/** Captured native run identity, undefined when the session is idle. */
+	runId?: string;
+	/** Native selection generation, bumped by session switch/tree navigation/reload. */
+	sessionGeneration?: string;
+	/** "full" means bounded automatic admission was exhausted: native retained the input; the gate must NOT classify or dispatch. */
+	admission?: "granted" | "full";
 }
 
+/** Ingress metadata bound to one input occurrence by the host */
+export interface InputEventMetadata {
+	occurrenceId?: string;
+	ingress?: "automatic" | "explicit";
+	runId?: string;
+	sessionGeneration?: string;
+	admission?: "granted" | "full";
+}
+
+/** Declarative disposition a gate can claim for one occurrence */
 /** Result from input event handler */
 export type InputEventResult =
 	| { action: "continue" }
 	| { action: "transform"; text: string; images?: ImageContent[] }
-	| { action: "handled" };
+	| { action: "handled" }
+	| { action: "disposition"; occurrenceId: string; disposition: InputDisposition };
 
 // ============================================================================
 // Tool Events
@@ -1405,6 +1452,7 @@ export type ExtensionEvent =
 	| ThinkingLevelSelectEvent
 	| UserBashEvent
 	| InputEvent
+	| InputDispositionEvent
 	| ToolCallEvent
 	| ToolResultEvent;
 
@@ -1634,6 +1682,18 @@ export interface ExtensionAPI {
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): () => void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): () => void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): () => void;
+	on(event: "input_disposition", handler: ExtensionHandler<InputDispositionEvent>): () => void;
+
+	// =========================================================================
+	// Input Disposition Mode
+	// =========================================================================
+
+	/** Enable or disable native input disposition (automatic ingress binding, declarative dispositions, idle work pickup). Default off. */
+	setInputDispositionEnabled(enabled: boolean): void;
+	/** Awaited idle work evaluation; thin wrapper over the extension context method. Refuses while busy or admission pending, then native schedules exactly one deferred evaluation. */
+	requestIdleWorkEvaluation(): Promise<EvaluateIdleWorkResult>;
+	/** Live queue readback for queued/held/replacement inputs. */
+	getQueuedInput(): QueuedInputRef[];
 
 	// =========================================================================
 	// Tool Registration
@@ -2171,6 +2231,9 @@ export interface ExtensionActions {
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
 	setThinkingLevel: SetThinkingLevelHandler;
+	setInputDispositionEnabled: (enabled: boolean) => void;
+	requestIdleWorkEvaluation: () => Promise<EvaluateIdleWorkResult>;
+	getQueuedInput: () => QueuedInputRef[];
 }
 
 /**
@@ -2199,6 +2262,19 @@ export interface ExtensionContextActions {
 	) => Promise<AgentToolCallOutcome>;
 	/** Backs `ExtensionToolContext.tools`. */
 	getCallableTools?: () => readonly AgentTool[];
+	/** Native input disposition surface. Present only when the session opts in. */
+	inputDisposition?: InputDispositionContextActions;
+}
+
+/** Native input disposition callbacks backing the ExtensionContext methods. */
+export interface InputDispositionContextActions {
+	version: number;
+	begin: (occurrenceId: string) => Promise<"granted" | "invalidated">;
+	finish: (occurrenceId: string) => void;
+	getDisposition: (occurrenceId: string) => InputDispositionEvent | undefined;
+	getQueuedInput: () => QueuedInputRef[];
+	evaluateIdleWork: () => Promise<EvaluateIdleWorkResult>;
+	releaseHeldInput: (occurrenceId: string, disposition: InputDisposition) => Promise<"released" | "rejected">;
 }
 
 /**

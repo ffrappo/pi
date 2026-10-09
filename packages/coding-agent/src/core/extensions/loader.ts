@@ -22,6 +22,7 @@ import { time } from "../timings.ts";
 import type { ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
 import type {
 	EntryRenderer,
+	EvaluateIdleWorkResult,
 	Extension,
 	ExtensionAPI,
 	ExtensionFactory,
@@ -31,6 +32,7 @@ import type {
 	MarkdownTransformer,
 	MessageRenderer,
 	ProviderConfig,
+	QueuedInputRef,
 	RegisteredCommand,
 	ToolDefinition,
 	ToolRendererResolver,
@@ -183,6 +185,9 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		setModel: () => Promise.reject(new Error("Extension runtime not initialized")),
 		getThinkingLevel: notInitialized,
 		setThinkingLevel: notInitialized,
+		setInputDispositionEnabled: notInitialized,
+		requestIdleWorkEvaluation: () => Promise.reject(new Error("Extension runtime not initialized")),
+		getQueuedInput: () => [],
 		flagValues: new Map(),
 		pendingProviderRegistrations: [],
 		pendingNativeProviderRegistrations: [],
@@ -451,6 +456,21 @@ function createExtensionAPI(
 		setThinkingLevel(level) {
 			assertActive();
 			runtime.setThinkingLevel(level);
+		},
+
+		setInputDispositionEnabled(enabled: boolean) {
+			assertActive();
+			runtime.setInputDispositionEnabled(enabled);
+		},
+
+		requestIdleWorkEvaluation(): Promise<EvaluateIdleWorkResult> {
+			assertActive();
+			return runtime.requestIdleWorkEvaluation();
+		},
+
+		getQueuedInput(): QueuedInputRef[] {
+			assertActive();
+			return runtime.getQueuedInput();
 		},
 
 		registerProvider(providerOrName: Provider | string, config?: ProviderConfig) {

@@ -90,6 +90,7 @@ import {
 	type ExtensionMode,
 	ExtensionRunner,
 	type ExtensionUIContext,
+	type InputEventMetadata,
 	type InputSource,
 	type MessageEndEvent,
 	type MessageStartEvent,
@@ -113,6 +114,15 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import {
+	type AdmittedOccurrence,
+	type EvaluateIdleWorkResult,
+	INPUT_DISPOSITION_VERSION,
+	type InputDisposition,
+	InputDispositionController,
+	type InputDispositionEvent,
+	type QueuedInputRef,
+} from "./input-disposition.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
@@ -234,7 +244,8 @@ export type AgentSessionEvent =
 			reason: "manual" | "threshold" | "overflow";
 	  }
 	| { type: "summarization_retry_finished" }
-	| { type: "bash_execution_update"; id?: string; delta: string };
+	| { type: "bash_execution_update"; id?: string; delta: string }
+	| InputDispositionEvent;
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -320,6 +331,8 @@ export interface PromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	/** Source of input for extension input event handlers. Defaults to "interactive". */
 	source?: InputSource;
+	/** Ingress classification for native input disposition. Absence means no automatic classification, idle included. */
+	ingress?: "automatic" | "explicit";
 	/** Internal hook used by RPC mode to observe how an accepted prompt was dispatched. Not called if the prompt is rejected. */
 	preflightResult?: (disposition: PromptDisposition) => void;
 }
@@ -394,6 +407,14 @@ export class AgentSession {
 	private _steeringMessages: string[] = [];
 	/** Tracks pending follow-up messages for UI display. Removed when delivered. */
 	private _followUpMessages: string[] = [];
+	/** Native input disposition controller (enabled via pi.setInputDispositionEnabled). */
+	private readonly _inputDispositionController = new InputDispositionController(
+		() => this.sessionManager,
+		(event) => this._emit(event),
+		() => this._evaluateIdleWork(),
+	);
+	/** True while the disposition dispatcher itself drives an abort, so abort() does not invalidate its own admission. */
+	private _dispatcherBusy = false;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 	/** Context-only custom messages queued during a run, flushed once the current turn's tool results are in. */
@@ -1078,6 +1099,7 @@ export class AgentSession {
 	private async _emitAgentSettled(): Promise<void> {
 		this._cacheWarmer?.onAgentSettled();
 		this._isAgentRunActive = false;
+		this._inputDispositionController.notifyRunSettled();
 		this._isEmittingAgentSettled = true;
 		try {
 			const aborted = this._agentRunAbortRequested;
@@ -1820,6 +1842,14 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		await this._runAgentLoop(() => this.agent.prompt(messages));
+	}
+
+	/**
+	 * Shared run loop for a fresh prompt or a normal idle continuation. Both paths run the
+	 * identical post-run handling, before-settle boundary and settle emission.
+	 */
+	private async _runAgentLoop(start: () => Promise<void>): Promise<void> {
 		this._agentRunAbortRequested = false;
 		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
 		this._failedResponse = undefined;
@@ -1828,8 +1858,9 @@ export class AgentSession {
 		// are dropped, so a tool that never registers does not stay pending.
 		this._pendingToolNames.clear();
 		this._isAgentRunActive = true;
+		this._inputDispositionController.notifyRunStart(this._inputDispositionController.nextRunId());
 		try {
-			await this.agent.prompt(messages);
+			await start();
 			while (!this._agentRunAbortRequested) {
 				if (await this._handlePostAgentRun()) {
 					if (this._agentRunAbortRequested) break;
@@ -1919,14 +1950,29 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		source: InputSource,
 		streamingBehavior?: "steer" | "followUp",
-	): Promise<{ text: string; images: ImageContent[] | undefined } | undefined> {
+		metadata?: InputEventMetadata,
+	): Promise<
+		| {
+				text: string;
+				images: ImageContent[] | undefined;
+				claim?: { occurrenceId: string; disposition: InputDisposition };
+		  }
+		| undefined
+	> {
 		if (!this._extensionRunner.hasHandlers("input")) {
 			return { text, images };
 		}
 
-		const inputResult = await this._extensionRunner.emitInput(text, images, source, streamingBehavior);
+		const inputResult = await this._extensionRunner.emitInput(text, images, source, streamingBehavior, metadata);
 		if (inputResult.action === "handled") {
 			return undefined;
+		}
+		if (inputResult.action === "disposition") {
+			return {
+				text,
+				images,
+				claim: { occurrenceId: inputResult.occurrenceId, disposition: inputResult.disposition },
+			};
 		}
 		if (inputResult.action === "transform") {
 			return { text: inputResult.text, images: inputResult.images ?? images };
@@ -1989,18 +2035,55 @@ export class AgentSession {
 			);
 		}
 
+		// Native input disposition: bind the occurrence before hooks when ingress is marked.
+		const ingress = options?.ingress;
+		let dispositionOccurrence: AdmittedOccurrence | undefined;
+		let admissionFull = false;
+		if (this._inputDispositionController.enabled && ingress) {
+			const admission = this._inputDispositionController.admitOccurrence({
+				text,
+				images: options?.images,
+				ingress,
+				streamingBehavior: this.isStreaming ? options?.streamingBehavior : undefined,
+			});
+			if (admission.isFull || !admission.occurrence) {
+				admissionFull = true;
+				dispositionOccurrence = admission.occurrence;
+			} else {
+				dispositionOccurrence = admission.occurrence;
+			}
+		}
+		const inputMetadata: InputEventMetadata | undefined = dispositionOccurrence
+			? {
+					occurrenceId: dispositionOccurrence.occurrenceId,
+					ingress: dispositionOccurrence.ingress,
+					runId: dispositionOccurrence.capturedRunId,
+					sessionGeneration: dispositionOccurrence.sessionGeneration,
+					admission: admissionFull ? "full" : "granted",
+				}
+			: undefined;
+
 		// Emit input event for extension interception (before skill/template expansion)
 		const processedInput = await this._runInputHandlers(
 			text,
 			options?.images,
 			options?.source ?? "interactive",
 			this.isStreaming ? options?.streamingBehavior : undefined,
+			inputMetadata,
 		);
-		if (!processedInput) {
+		if (!processedInput || admissionFull) {
+			// Admission-exhausted inputs stay in native custody with a visible busy outcome;
+			// the gate must not classify or dispatch them.
 			preflightResult?.("handled");
 			return;
 		}
 		const { text: currentText, images: currentImages } = processedInput;
+		if (processedInput.claim && dispositionOccurrence) {
+			// Declarative claim: the owning dispatcher executes it once; input hooks do not re-run.
+			preflightResult?.("handled");
+			await this._executeClaimedDisposition(dispositionOccurrence, processedInput.claim.disposition);
+			return;
+		}
 
 		// Expand skill commands (/skill:name args) and prompt templates (/template args)
 		let expandedText = currentText;
@@ -2025,6 +2108,19 @@ export class AgentSession {
 			return;
 		}
 
+		await this._runPromptPipeline(expandedText, currentImages, () => preflightResult?.("started"));
+	}
+
+	/**
+	 * Normal prompt pipeline after input hooks and expansion: flushes pending context,
+	 * validates the model, emits before_agent_start, then starts one run. Also the single
+	 * dispatch path for admitted dispositions (input hooks are not re-run here).
+	 */
+	private async _runPromptPipeline(
+		expandedText: string,
+		currentImages: ImageContent[] | undefined,
+		onStart?: () => void,
+	): Promise<void> {
 		// Flush any pending bash and custom messages before the new prompt
 		this._flushPendingBashMessages();
 		this._flushPendingCustomMessages();
@@ -2106,8 +2202,228 @@ export class AgentSession {
 		this._runSystemPromptOptions = result.systemPromptOptions;
 		if (updateMessage) messages.unshift(updateMessage);
 
-		preflightResult?.("started");
+		onStart?.();
 		await this._runAgentPrompt(messages);
+	}
+
+	// =========================================================================
+	// Input disposition dispatcher
+	// =========================================================================
+
+	/** Whether native input disposition mode is currently enabled. */
+	isInputDispositionEnabled(): boolean {
+		return this._inputDispositionController.enabled;
+	}
+
+	/** Current disposition record for one occurrence, as a plain event snapshot. */
+	private _getInputDispositionEvent(occurrenceId: string): InputDispositionEvent | undefined {
+		const occ = this._inputDispositionController.getOccurrence(occurrenceId);
+		if (!occ) return undefined;
+		return {
+			type: "input_disposition",
+			occurrenceId: occ.occurrenceId,
+			sessionId: occ.sessionId,
+			state: occ.state,
+			ingress: occ.ingress,
+			disposition: occ.disposition,
+			revision: occ.revision,
+			detail: occ.detail,
+		};
+	}
+
+	private _getQueuedInputRefs(): QueuedInputRef[] {
+		return this._inputDispositionController.getQueuedInput();
+	}
+
+	/** Awaited idle work pickup: runs the normal before-settle work-queue evaluation once when idle. */
+	private async _evaluateIdleWork(): Promise<EvaluateIdleWorkResult> {
+		if (!this.isIdle || this._isAgentRunActive) {
+			this._inputDispositionController.scheduleDeferredIdleEvaluation();
+			return { started: false, ranWork: false, reason: "busy" };
+		}
+		if (this._inputDispositionController.pendingAdmissionCount > 0) {
+			this._inputDispositionController.scheduleDeferredIdleEvaluation();
+			return { started: false, ranWork: false, reason: "input_pending" };
+		}
+		if (this._isEmittingAgentSettled || this._deferredSettledActions.length > 0) {
+			this._inputDispositionController.scheduleDeferredIdleEvaluation();
+			return { started: false, ranWork: false, reason: "deferred_settling" };
+		}
+		if (this.sessionManager.getBranch().length === 0) {
+			return { started: false, ranWork: false, reason: "empty_context" };
+		}
+
+		// Normal before-settle evaluation: extensions may inject drafts and continue.
+		const shouldContinue = await this._runBeforeSettleBoundary();
+		if (!shouldContinue) {
+			return { started: true, ranWork: false };
+		}
+		// One normal run through the shared run loop (identical settle machinery).
+		await this._runAgentLoop(() => this.agent.continue());
+		return { started: true, ranWork: true };
+	}
+
+	/** Explicitly release a held input with the given disposition. */
+	private async _releaseHeldInput(
+		occurrenceId: string,
+		disposition: InputDisposition,
+	): Promise<"released" | "rejected"> {
+		const held = this._inputDispositionController.getHeldInput(occurrenceId);
+		const occ = this._inputDispositionController.getOccurrence(occurrenceId);
+		if (!held || !occ) return "rejected";
+		if (occ.sessionGeneration !== this._inputDispositionController.currentGeneration) {
+			this._inputDispositionController.transition(occurrenceId, "blocked", {
+				disposition,
+				detail: "stale_generation",
+			});
+			return "rejected";
+		}
+		if (held.sessionId !== this.sessionManager.getSessionId()) {
+			this._inputDispositionController.transition(occurrenceId, "blocked", { disposition, detail: "stale_session" });
+			return "rejected";
+		}
+		if (disposition === "interrupt_now") {
+			this._inputDispositionController.transition(occurrenceId, "blocked", {
+				disposition,
+				detail: "interrupt_not_releasable",
+			});
+			return "rejected";
+		}
+		this._inputDispositionController.takeHeldInput(occurrenceId);
+		this._inputDispositionController.transition(occurrenceId, "released", { disposition });
+		const admitted: AdmittedOccurrence = { ...occ, text: held.text, images: held.images };
+		await this._executeClaimedDisposition(admitted, disposition);
+		return "released";
+	}
+
+	/** Execute one claimed disposition exactly once against the original occurrence. */
+	private async _executeClaimedDisposition(occ: AdmittedOccurrence, disposition: InputDisposition): Promise<void> {
+		try {
+			switch (disposition) {
+				case "send_now": {
+					if (this.isStreaming || this._isAgentRunActive) {
+						// Idle send-now becoming busy: visible conflict, text retained, no second run.
+						this._inputDispositionController.holdInput(occ.occurrenceId, occ.text, occ.images);
+						this._inputDispositionController.transition(occ.occurrenceId, "conflict", {
+							disposition,
+							detail: "run_active",
+						});
+						return;
+					}
+					this._inputDispositionController.transition(occ.occurrenceId, "dispatched", { disposition });
+					await this._dispatchAdmittedOccurrence(occ);
+					return;
+				}
+				case "steer":
+				case "follow_up": {
+					const capturedRunValid =
+						occ.capturedRunId !== undefined && occ.capturedRunId === this._inputDispositionController.activeRunId;
+					if ((this.isStreaming || this._isAgentRunActive) && capturedRunValid) {
+						// Live run: queue without re-running input hooks; queue order stays native.
+						let expandedText = this._expandSkillCommand(occ.text);
+						expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+						this._inputDispositionController.transition(occ.occurrenceId, "queued", {
+							disposition,
+							queue: disposition === "steer" ? "steer" : "follow_up",
+						});
+						if (disposition === "steer") {
+							await this._queueSteer(expandedText, occ.images, occ.occurrenceId);
+						} else {
+							await this._queueFollowUp(expandedText, occ.images, occ.occurrenceId);
+						}
+						return;
+					}
+					// Idle or captured run already ended naturally: normalize through native queue
+					// order (steering drains before follow-ups) and start one normal run.
+					this._inputDispositionController.transition(occ.occurrenceId, "dispatched", { disposition });
+					await this._dispatchAdmittedOccurrence(occ);
+					return;
+				}
+				case "interrupt_now": {
+					await this._executeInterruptNow(occ);
+					return;
+				}
+			}
+		} catch (err) {
+			this._inputDispositionController.transition(occ.occurrenceId, "failed", {
+				disposition,
+				detail: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
+	/** interrupt_now: durable replacement record, abort, await real idle, revalidate, dispatch the same replacement once. */
+	private async _executeInterruptNow(occ: AdmittedOccurrence): Promise<void> {
+		this._inputDispositionController.transition(occ.occurrenceId, "cancel_requested", {
+			disposition: "interrupt_now",
+		});
+		this._inputDispositionController.reserveReplacement(occ.occurrenceId);
+		this._inputDispositionController.transition(occ.occurrenceId, "waiting_idle", { disposition: "interrupt_now" });
+
+		// Older steering is held visibly; follow-ups stay queued behind the replacement run.
+		const heldSteering = [...this._steeringMessages];
+		if (heldSteering.length > 0) {
+			this._steeringMessages = [];
+			this.agent.clearSteeringQueue();
+			for (const text of heldSteering) {
+				const held = this._inputDispositionController.admitOccurrence({
+					text,
+					ingress: "explicit",
+					streamingBehavior: "steer",
+				});
+				if (held.occurrence) {
+					this._inputDispositionController.holdInput(held.occurrence.occurrenceId, text);
+					this._inputDispositionController.transition(held.occurrence.occurrenceId, "held", {
+						detail: "held_by_replacement",
+					});
+				}
+			}
+			this._emitQueueUpdate();
+		}
+
+		// Abort with the dispatcher guard so abort() does not invalidate our own admission.
+		this._dispatcherBusy = true;
+		try {
+			if (this._isAgentRunActive || this.isStreaming) {
+				await this.abort();
+			}
+		} finally {
+			this._dispatcherBusy = false;
+		}
+
+		// Revalidate before dispatching the SAME admitted replacement.
+		if (
+			!this._inputDispositionController.enabled ||
+			occ.sessionGeneration !== this._inputDispositionController.currentGeneration
+		) {
+			this._inputDispositionController.holdInput(occ.occurrenceId, occ.text, occ.images);
+			this._inputDispositionController.transition(occ.occurrenceId, "conflict", { detail: "stale_generation" });
+			this._inputDispositionController.clearReservedReplacement();
+			return;
+		}
+		if (this.isStreaming || this._isAgentRunActive) {
+			// A newer run started meanwhile: never abort it; resolve to held conflict.
+			this._inputDispositionController.holdInput(occ.occurrenceId, occ.text, occ.images);
+			this._inputDispositionController.transition(occ.occurrenceId, "conflict", { detail: "newer_run_active" });
+			this._inputDispositionController.clearReservedReplacement();
+			return;
+		}
+
+		this._inputDispositionController.transition(occ.occurrenceId, "replacement_started", {
+			disposition: "interrupt_now",
+		});
+		try {
+			await this._dispatchAdmittedOccurrence(occ);
+		} finally {
+			this._inputDispositionController.clearReservedReplacement();
+		}
+	}
+
+	/** Dispatch one admitted occurrence through the normal pipeline: expansion and provider admission, no input hook re-run. */
+	private async _dispatchAdmittedOccurrence(occ: AdmittedOccurrence): Promise<void> {
+		let expandedText = this._expandSkillCommand(occ.text);
+		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+		await this._runPromptPipeline(expandedText, occ.images);
 	}
 
 	/**
@@ -2175,6 +2491,7 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
 		source: InputSource,
+		occurrenceId?: string,
 	): Promise<QueuedInputDisposition> {
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -2192,9 +2509,9 @@ export class AgentSession {
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		if (behavior === "steer") {
-			await this._queueSteer(expandedText, processedInput.images);
+			await this._queueSteer(expandedText, processedInput.images, occurrenceId);
 		} else {
-			await this._queueFollowUp(expandedText, processedInput.images);
+			await this._queueFollowUp(expandedText, processedInput.images, occurrenceId);
 		}
 		return "queued";
 	}
@@ -2235,7 +2552,7 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueSteer(text: string, images?: ImageContent[], occurrenceId?: string): Promise<void> {
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -2247,12 +2564,18 @@ export class AgentSession {
 			content,
 			timestamp: Date.now(),
 		});
+		if (occurrenceId) {
+			this._inputDispositionController.transition(occurrenceId, "queued", {
+				queue: "steer",
+				queuePosition: this._steeringMessages.length,
+			});
+		}
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueFollowUp(text: string, images?: ImageContent[], occurrenceId?: string): Promise<void> {
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -2260,6 +2583,12 @@ export class AgentSession {
 			content.push(...images);
 		}
 		this.agent.followUp({ role: "user", content, timestamp: Date.now() });
+		if (occurrenceId) {
+			this._inputDispositionController.transition(occurrenceId, "queued", {
+				queue: "follow_up",
+				queuePosition: this._followUpMessages.length,
+			});
+		}
 	}
 
 	/**
@@ -2409,9 +2738,13 @@ export class AgentSession {
 		return { steering, followUp };
 	}
 
-	/** Number of pending messages (includes both steering and follow-up) */
+	/** Number of pending messages (includes both steering and follow-up, plus pending automatic admissions) */
 	get pendingMessageCount(): number {
-		return this._steeringMessages.length + this._followUpMessages.length;
+		return (
+			this._steeringMessages.length +
+			this._followUpMessages.length +
+			this._inputDispositionController.pendingAdmissionCount
+		);
 	}
 
 	/** Get pending steering messages (read-only) */
@@ -2432,6 +2765,12 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		// An explicit interrupt invalidates in-flight and queued automatic decisions;
+		// their undelivered inputs move to held custody and cannot revive. The dispatcher's
+		// own aborts are guarded so they do not invalidate their own admission.
+		if (this._inputDispositionController.enabled && !this._dispatcherBusy) {
+			this._inputDispositionController.invalidateInFlightDueToInterrupt();
+		}
 		if (this._isAgentRunActive) {
 			this._agentRunAbortRequested = true;
 		}
@@ -3432,6 +3771,9 @@ export class AgentSession {
 				},
 				getThinkingLevel: () => this.thinkingLevel,
 				setThinkingLevel: (level) => this.setThinkingLevel(level),
+				setInputDispositionEnabled: (enabled) => this._inputDispositionController.setEnabled(enabled),
+				requestIdleWorkEvaluation: () => this._evaluateIdleWork(),
+				getQueuedInput: () => this._inputDispositionController.getQueuedInput(),
 			},
 			{
 				getModel: () => this.model,
@@ -3466,6 +3808,15 @@ export class AgentSession {
 				getSystemPromptOptions: () => this._baseSystemPromptOptions,
 				executeTool: (callerId, name, args, options) => this._executeNestedToolCall(callerId, name, args, options),
 				getCallableTools: () => this._getCallableTools(),
+				inputDisposition: {
+					version: INPUT_DISPOSITION_VERSION,
+					begin: (occurrenceId) => this._inputDispositionController.beginInputDisposition(occurrenceId),
+					finish: (occurrenceId) => this._inputDispositionController.finishInputDisposition(occurrenceId),
+					getDisposition: (occurrenceId) => this._getInputDispositionEvent(occurrenceId),
+					getQueuedInput: () => this._getQueuedInputRefs(),
+					evaluateIdleWork: () => this._evaluateIdleWork(),
+					releaseHeldInput: (occurrenceId, disposition) => this._releaseHeldInput(occurrenceId, disposition),
+				},
 			},
 			{
 				registerProvider: (name, config) => {
@@ -3658,6 +4009,8 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		// Tree navigation and reload invalidate every pending disposition decision.
+		this._inputDispositionController.bumpGeneration("reload");
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
@@ -3973,6 +4326,8 @@ export class AgentSession {
 				"Wait for the current compaction or tree navigation to finish before navigating the session tree.",
 			);
 		}
+		// Tree navigation invalidates every pending disposition decision.
+		this._inputDispositionController.bumpGeneration("tree_navigation");
 
 		const oldLeafId = this.sessionManager.getLeafId();
 

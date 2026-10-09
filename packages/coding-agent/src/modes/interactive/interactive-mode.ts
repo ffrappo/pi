@@ -1252,7 +1252,10 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				await this.session.prompt(userInput);
+				// Plain Enter under enabled disposition mode is automatic ingress; no marker
+				// (mode off or programmatic callers) means no automatic classification.
+				const ingress = this.session.isInputDispositionEnabled() ? "automatic" : undefined;
+				await this.session.prompt(userInput, { ingress });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
@@ -3378,7 +3381,7 @@ export class InteractiveMode {
 			if (this.session.isStreaming) {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.session.prompt(text, { streamingBehavior: "steer" });
+				await this.session.prompt(text, { streamingBehavior: "steer", ingress: "explicit" });
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				return;
@@ -4488,12 +4491,12 @@ export class InteractiveMode {
 			return;
 		}
 
-		// Alt+Enter queues a follow-up message (waits until agent finishes)
+		// Alt+Enter queues a follow-up message (waits until agent finishes), explicit ingress
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.session.isStreaming) {
 			this.editor.addToHistory?.(text);
 			this.editor.setText("");
-			await this.session.prompt(text, { streamingBehavior: "followUp" });
+			await this.session.prompt(text, { streamingBehavior: "followUp", ingress: "explicit" });
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
 		}

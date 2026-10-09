@@ -95,6 +95,9 @@ describe("ExtensionRunner", () => {
 		setModel: async () => false,
 		getThinkingLevel: () => "off",
 		setThinkingLevel: () => {},
+		setInputDispositionEnabled: () => {},
+		requestIdleWorkEvaluation: async () => ({ started: false, ranWork: false }),
+		getQueuedInput: () => [],
 	};
 
 	const extensionContextActions: ExtensionContextActions = {

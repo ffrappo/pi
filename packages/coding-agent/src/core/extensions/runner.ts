@@ -56,7 +56,10 @@ import type {
 	ExtensionShortcut,
 	ExtensionToolContext,
 	ExtensionUIContext,
+	InputDisposition,
+	InputDispositionContextActions,
 	InputEvent,
+	InputEventMetadata,
 	InputEventResult,
 	InputSource,
 	LoadExtensionsResult,
@@ -374,6 +377,7 @@ export class ExtensionRunner {
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	private compactFn: (options?: CompactOptions) => void = () => {};
 	private getSystemPromptFn: () => string = () => "";
+	private inputDispositionActions: InputDispositionContextActions | undefined;
 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () =>
 		normalizeBuildSystemPromptOptions({ cwd: this.cwd });
 	private executeToolFn: ExtensionContextActions["executeTool"];
@@ -434,6 +438,9 @@ export class ExtensionRunner {
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+		this.runtime.setInputDispositionEnabled = actions.setInputDispositionEnabled;
+		this.runtime.requestIdleWorkEvaluation = actions.requestIdleWorkEvaluation;
+		this.runtime.getQueuedInput = actions.getQueuedInput;
 		this.runtime.createContext = () => this.createContext();
 
 		// Context actions (required)
@@ -452,6 +459,7 @@ export class ExtensionRunner {
 			contextActions.getSystemPromptOptions ?? (() => normalizeBuildSystemPromptOptions({ cwd: this.cwd }));
 		this.executeToolFn = contextActions.executeTool;
 		this.getCallableToolsFn = contextActions.getCallableTools ?? (() => []);
+		this.inputDispositionActions = contextActions.inputDisposition;
 
 		// Servers registered from now on reach the extension that connects them right away. Servers
 		// registered during loading are read on session_start.
@@ -951,6 +959,31 @@ export class ExtensionRunner {
 				runner.assertActive();
 				return runner.getSystemPromptFn();
 			},
+			...(runner.inputDispositionActions
+				? {
+						inputDispositionVersion: runner.inputDispositionActions.version,
+						beginInputDisposition: (occurrenceId: string) => {
+							runner.assertActive();
+							return runner.inputDispositionActions!.begin(occurrenceId);
+						},
+						getInputDisposition: (occurrenceId: string) => {
+							runner.assertActive();
+							return runner.inputDispositionActions!.getDisposition(occurrenceId);
+						},
+						getQueuedInput: () => {
+							runner.assertActive();
+							return runner.inputDispositionActions!.getQueuedInput();
+						},
+						evaluateIdleWork: () => {
+							runner.assertActive();
+							return runner.inputDispositionActions!.evaluateIdleWork();
+						},
+						releaseHeldInput: (occurrenceId: string, disposition: InputDisposition) => {
+							runner.assertActive();
+							return runner.inputDispositionActions!.releaseHeldInput(occurrenceId, disposition);
+						},
+					}
+				: {}),
 		};
 	}
 
@@ -1516,45 +1549,86 @@ export class ExtensionRunner {
 		return { skillPaths, promptPaths, themePaths };
 	}
 
-	/** Emit input event. Transforms chain, "handled" short-circuits. */
+	/** Emit input event. Transforms chain, "handled" short-circuits. With disposition metadata, a first declarative claim is returned; duplicates and id mismatches are explicit extension errors. */
 	async emitInput(
 		text: string,
 		images: ImageContent[] | undefined,
 		source: InputSource,
 		streamingBehavior?: "steer" | "followUp",
+		metadata?: InputEventMetadata,
 	): Promise<InputEventResult> {
 		const ctx = this.createContext();
 		let currentText = text;
 		let currentImages = images;
+		let claim: { occurrenceId: string; disposition: InputDisposition } | undefined;
 
-		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "input")) {
-			for (const handler of handlers) {
-				try {
-					const event: InputEvent = {
-						type: "input",
-						text: currentText,
-						images: currentImages,
-						source,
-						streamingBehavior,
-					};
-					const result = (await handler(event, ctx)) as InputEventResult | undefined;
-					if (result?.action === "handled") return result;
-					if (result?.action === "transform") {
-						currentText = result.text;
-						currentImages = result.images ?? currentImages;
+		try {
+			for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "input")) {
+				for (const handler of handlers) {
+					try {
+						const event: InputEvent = {
+							type: "input",
+							text: currentText,
+							images: currentImages,
+							source,
+							streamingBehavior,
+							...(metadata?.occurrenceId !== undefined ? { occurrenceId: metadata.occurrenceId } : {}),
+							...(metadata?.ingress !== undefined ? { ingress: metadata.ingress } : {}),
+							...(metadata?.runId !== undefined ? { runId: metadata.runId } : {}),
+							...(metadata?.sessionGeneration !== undefined
+								? { sessionGeneration: metadata.sessionGeneration }
+								: {}),
+							...(metadata?.admission !== undefined ? { admission: metadata.admission } : {}),
+						};
+						const result = (await handler(event, ctx)) as InputEventResult | undefined;
+						if (result?.action === "handled") {
+							// A later handled drops an earlier undispatched claim
+							claim = undefined;
+							return result;
+						}
+						if (result?.action === "disposition") {
+							if (!metadata?.occurrenceId || result.occurrenceId !== metadata.occurrenceId) {
+								this.emitError({
+									extensionPath: ext.path,
+									event: "input",
+									error: `disposition claim for unknown or mismatched occurrenceId "${result.occurrenceId}"`,
+								});
+							} else if (claim) {
+								this.emitError({
+									extensionPath: ext.path,
+									event: "input",
+									error: `duplicate disposition claim for occurrence "${result.occurrenceId}"; the first claim stands`,
+								});
+							} else {
+								claim = { occurrenceId: result.occurrenceId, disposition: result.disposition };
+							}
+							continue;
+						}
+						if (result?.action === "transform") {
+							currentText = result.text;
+							currentImages = result.images ?? currentImages;
+						}
+					} catch (err) {
+						this.emitError({
+							extensionPath: ext.path,
+							event: "input",
+							error: err instanceof Error ? err.message : String(err),
+							stack: err instanceof Error ? err.stack : undefined,
+						});
 					}
-				} catch (err) {
-					this.emitError({
-						extensionPath: ext.path,
-						event: "input",
-						error: err instanceof Error ? err.message : String(err),
-						stack: err instanceof Error ? err.stack : undefined,
-					});
 				}
 			}
+			if (claim) {
+				return { action: "disposition", occurrenceId: claim.occurrenceId, disposition: claim.disposition };
+			}
+			return currentText !== text || currentImages !== images
+				? { action: "transform", text: currentText, images: currentImages }
+				: { action: "continue" };
+		} finally {
+			// Release the single-flight admission slot when this input dispatch pass completes
+			if (metadata?.occurrenceId) {
+				this.inputDispositionActions?.finish(metadata.occurrenceId);
+			}
 		}
-		return currentText !== text || currentImages !== images
-			? { action: "transform", text: currentText, images: currentImages }
-			: { action: "continue" };
 	}
 }
