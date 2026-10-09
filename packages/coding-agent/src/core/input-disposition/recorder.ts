@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, openSync, readSync, statSync } from "node:fs";
 import type { SessionManager } from "../session-manager.ts";
 import {
 	type AdmittedOccurrence,
@@ -6,6 +6,36 @@ import {
 	type InputDispositionEvent,
 	type InputDispositionJournalEntry,
 } from "./types.ts";
+
+/**
+ * Read the last JSONL line of `file`, bounded to the final `tailBytes` bytes. The writer
+ * (SessionManager) appends exactly one newline-terminated JSON line per entry, so the
+ * last non-empty line of the tail is the append being confirmed.
+ */
+function readLastJsonLine(file: string, tailBytes: number): { id?: string; data?: unknown } | undefined {
+	const size = statSync(file).size;
+	if (size === 0) return undefined;
+	const bytes = Math.min(size, tailBytes);
+	const buffer = Buffer.alloc(bytes);
+	const fd = openSync(file, "r");
+	try {
+		const read = readSync(fd, buffer, 0, bytes, size - bytes);
+		const lines = buffer.subarray(0, read).toString("utf8").split("\n");
+		// The file ends with a newline and the window may open mid-previous-line; the append
+		// being confirmed is the last non-empty line.
+		let last = "";
+		for (let i = lines.length - 1; i >= 0; i--) {
+			if (lines[i].trim().length > 0) {
+				last = lines[i];
+				break;
+			}
+		}
+		if (last.length === 0) return undefined;
+		return JSON.parse(last);
+	} finally {
+		closeSync(fd);
+	}
+}
 
 /** One journal owner. Unconfirmed writes stop admission; they never become success. */
 export class InputDispositionRecorder {
@@ -50,14 +80,16 @@ export class InputDispositionRecorder {
 			at: Date.now(),
 		};
 		const id = manager.appendCustomEntry(INPUT_DISPOSITION_CUSTOM_TYPE, entry);
-		if (!existsSync(file)) return id; // fresh session: the first user-message flush writes this entry too
+		if (manager.getSessionFile() !== file) throw new Error(`Disposition journal target changed: ${id}`);
+		// Fresh sessions keep entries in memory until the first user or assistant message
+		// flush; custody must be durable at persist time, so the owning manager flushes now.
+		manager.ensureFlushed();
+		const expected = JSON.stringify(entry);
 		try {
-			const disk = readFileSync(manager.getSessionFile()!, "utf8")
-				.trim()
-				.split("\n")
-				.map((line) => JSON.parse(line));
-			const saved = disk.find((value) => value.id === id);
-			if (!saved || JSON.stringify(saved.data) !== JSON.stringify(entry))
+			// Confirm only the actual append: last disk line must carry the exact id and payload.
+			// The line is the entry serialization plus bounded wrapper fields (type, ids, timestamp).
+			const saved = readLastJsonLine(file, Buffer.byteLength(expected, "utf8") + 4096);
+			if (!saved || saved.id !== id || JSON.stringify(saved.data) !== expected)
 				throw new Error(`Input custody unconfirmed: ${id}`);
 		} catch (error) {
 			this.failure = error;

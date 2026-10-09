@@ -318,8 +318,8 @@ export interface ExtensionBindings {
 	onError?: ExtensionErrorListener;
 }
 
-export type QueuedInputDisposition = "handled" | "queued";
-export type PromptDisposition = QueuedInputDisposition | "started";
+export type QueuedInputDisposition = "handled" | "queued" | "started" | "held";
+export type PromptDisposition = QueuedInputDisposition;
 
 /** Options for AgentSession.prompt() */
 export interface PromptOptions {
@@ -417,6 +417,21 @@ export class AgentSession {
 			void this._extensionRunner?.emit(event);
 		},
 		() => this._evaluateIdleWork(),
+		(error) => {
+			// Deferred idle-evaluation failures surface through the real extension error
+			// channel so a damaged custody owner is visible instead of silently blocking
+			// automatic work; no runner yet falls back to the console.
+			const message = error instanceof Error ? error.message : String(error);
+			if (this._extensionRunner) {
+				this._extensionRunner.emitError({
+					extensionPath: "<input-disposition>",
+					event: "input",
+					error: `Idle work evaluation failed: ${message}`,
+				});
+			} else {
+				console.error("Idle work evaluation failed:", error);
+			}
+		},
 	);
 	/** True while the disposition dispatcher itself drives an abort, so abort() does not invalidate its own admission. */
 	private _dispatcherBusy = false;
@@ -2112,7 +2127,8 @@ export class AgentSession {
 					dispositionOccurrence.state === "held" ||
 					dispositionOccurrence.state === "cancelled")
 			) {
-				preflightResult?.("handled");
+				// Retained custody reports held; lifecycle-invalidated inputs report handled.
+				preflightResult?.(dispositionOccurrence.state === "held" ? "held" : "handled");
 				return;
 			}
 			if (!processedInput || admissionFull) {
@@ -2122,18 +2138,20 @@ export class AgentSession {
 					});
 				// Admission-exhausted inputs stay in native custody with a visible busy outcome;
 				// the gate must not classify or dispatch them.
-				preflightResult?.("handled");
+				preflightResult?.(admissionFull ? "held" : "handled");
 				return;
 			}
 			const { text: currentText, images: currentImages } = processedInput;
 			const requestedDisposition = processedInput.claim?.disposition ?? options?.disposition;
 			if (requestedDisposition && dispositionOccurrence) {
-				// Declarative claim: the owning dispatcher executes it once; input hooks do not re-run.
-				preflightResult?.("handled");
-				await this._executeClaimedDisposition(
+				// Declarative claim: the owning dispatcher executes it once; input hooks do not
+				// re-run. The preflight disposition is the dispatcher's actual outcome (held
+				// conflict, queued, or started run), reported once after it resolves.
+				const outcome = await this._executeClaimedDisposition(
 					{ ...dispositionOccurrence, text: currentText, images: currentImages },
 					requestedDisposition,
 				);
+				preflightResult?.(outcome);
 				return;
 			}
 
@@ -2393,8 +2411,15 @@ export class AgentSession {
 		return "released";
 	}
 
-	/** Execute one claimed disposition exactly once against the original occurrence. */
-	private async _executeClaimedDisposition(occ: AdmittedOccurrence, disposition: InputDisposition): Promise<void> {
+	/**
+	 * Execute one claimed disposition exactly once against the original occurrence.
+	 * Returns the actual dispatcher outcome so callers and RPC observers report what
+	 * really happened instead of a constant.
+	 */
+	private async _executeClaimedDisposition(
+		occ: AdmittedOccurrence,
+		disposition: InputDisposition,
+	): Promise<QueuedInputDisposition> {
 		if (
 			occ.sessionGeneration !== this._inputDispositionController.currentGeneration ||
 			occ.sessionId !== this.sessionManager.getSessionId()
@@ -2411,11 +2436,11 @@ export class AgentSession {
 							disposition,
 							detail: "conflict: a run is active",
 						});
-						return;
+						return "held";
 					}
 					this._inputDispositionController.transition(occ.occurrenceId, "dispatched", { disposition });
 					await this._dispatchAdmittedOccurrence(occ);
-					return;
+					return "started";
 				}
 				case "steer":
 				case "follow_up": {
@@ -2427,7 +2452,7 @@ export class AgentSession {
 							disposition,
 							detail: "conflict: captured run ended",
 						});
-						return;
+						return "held";
 					}
 					if ((this.isStreaming || this._isAgentRunActive) && capturedRunValid) {
 						// Live run: queue without re-running input hooks; queue order stays native.
@@ -2442,7 +2467,7 @@ export class AgentSession {
 						} else {
 							await this._queueFollowUp(expandedText, occ.images, occ.occurrenceId);
 						}
-						return;
+						return "queued";
 					}
 					// Idle or captured run already ended naturally: normalize through native queue
 					// order (steering drains before follow-ups) and start one normal run.
@@ -2452,11 +2477,10 @@ export class AgentSession {
 					else await this._queueFollowUp(normalizedText, occ.images, occ.occurrenceId);
 					this._inputDispositionController.finishInputDisposition(occ.occurrenceId);
 					await this._runAgentLoop(() => this.agent.continue());
-					return;
+					return "started";
 				}
 				case "interrupt_now": {
-					await this._executeInterruptNow(occ);
-					return;
+					return await this._executeInterruptNow(occ);
 				}
 			}
 		} catch (err) {
@@ -2499,7 +2523,7 @@ export class AgentSession {
 	}
 
 	/** interrupt_now: durable replacement record, abort, await real idle, revalidate, dispatch the same replacement once. */
-	private async _executeInterruptNow(occ: AdmittedOccurrence): Promise<void> {
+	private async _executeInterruptNow(occ: AdmittedOccurrence): Promise<QueuedInputDisposition> {
 		if (
 			(this._isAgentRunActive || this.isStreaming) &&
 			occ.capturedRunId !== this._inputDispositionController.activeRunId
@@ -2509,11 +2533,11 @@ export class AgentSession {
 				disposition: "interrupt_now",
 				detail: "conflict: stale run",
 			});
-			return;
+			return "held";
 		}
 		this._inputDispositionController.reserveReplacement(occ.occurrenceId);
 		try {
-			await this._executeInterruptNowReserved(occ);
+			return await this._executeInterruptNowReserved(occ);
 		} catch (error) {
 			// A throwing abort or custody error must not leak the reservation: it
 			// would count as pending admission and block idle work evaluation.
@@ -2523,7 +2547,7 @@ export class AgentSession {
 		}
 	}
 
-	private async _executeInterruptNowReserved(occ: AdmittedOccurrence): Promise<void> {
+	private async _executeInterruptNowReserved(occ: AdmittedOccurrence): Promise<QueuedInputDisposition> {
 		if (occ.ingress === "explicit") this._inputDispositionController.invalidateInFlightDueToInterrupt();
 		this._inputDispositionController.transition(occ.occurrenceId, "cancel_requested", {
 			disposition: "interrupt_now",
@@ -2579,7 +2603,7 @@ export class AgentSession {
 				detail: "conflict: stale generation",
 			});
 			this._inputDispositionController.clearReservedReplacement(occ.occurrenceId);
-			return;
+			return "held";
 		}
 		if (this.isStreaming || this._isAgentRunActive) {
 			// A newer run started meanwhile: never abort it; retained custody stays held.
@@ -2589,7 +2613,7 @@ export class AgentSession {
 				detail: "conflict: newer run active",
 			});
 			this._inputDispositionController.clearReservedReplacement(occ.occurrenceId);
-			return;
+			return "held";
 		}
 
 		this._inputDispositionController.transition(occ.occurrenceId, "replacement_started", {
@@ -2600,6 +2624,7 @@ export class AgentSession {
 		} finally {
 			this._inputDispositionController.clearReservedReplacement(occ.occurrenceId);
 		}
+		return "started";
 	}
 
 	/** Dispatch one admitted occurrence through the normal pipeline: expansion and provider admission, no input hook re-run. */
@@ -2722,6 +2747,8 @@ export class AgentSession {
 		options?: { source?: InputSource },
 	): Promise<QueuedInputDisposition> {
 		if (this._inputDispositionController.enabled) {
+			// The claimed dispatcher reports the real outcome (held conflict, queued, started);
+			// one admission, one preflight report.
 			let result: QueuedInputDisposition = "handled";
 			await this.prompt(text, {
 				images,
@@ -2730,7 +2757,7 @@ export class AgentSession {
 				disposition: "steer",
 				streamingBehavior: "steer",
 				preflightResult: (outcome) => {
-					if (outcome !== "handled") result = "queued";
+					result = outcome;
 				},
 			});
 			return result;
@@ -2752,14 +2779,20 @@ export class AgentSession {
 		options?: { source?: InputSource },
 	): Promise<QueuedInputDisposition> {
 		if (this._inputDispositionController.enabled) {
+			// Same single admission path as steer(): the dispatcher's actual outcome, never a
+			// constant queued.
+			let result: QueuedInputDisposition = "handled";
 			await this.prompt(text, {
 				images,
 				source: options?.source ?? "interactive",
 				ingress: "explicit",
 				disposition: "follow_up",
 				streamingBehavior: "followUp",
+				preflightResult: (outcome) => {
+					result = outcome;
+				},
 			});
-			return "queued";
+			return result;
 		}
 		return this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
 	}

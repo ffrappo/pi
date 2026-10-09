@@ -1169,23 +1169,40 @@ export class SessionManager {
 		);
 	}
 
+	/** Create this.sessionFile exclusively and write every in-memory entry as one JSONL line each. */
+	private _writeAllEntriesToNewFile(): void {
+		const fd = openSync(this.sessionFile!, "wx");
+		try {
+			for (const e of this.fileEntries) {
+				writeFileSync(fd, `${JSON.stringify(e)}\n`);
+			}
+		} finally {
+			closeSync(fd);
+		}
+	}
+
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
 		if (!this.flushed) {
 			if (!this._hasConversation()) return;
-			const fd = openSync(this.sessionFile, "wx");
-			try {
-				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
-				}
-			} finally {
-				closeSync(fd);
-			}
+			this._writeAllEntriesToNewFile();
 			this.flushed = true;
 		} else {
 			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
 		}
+	}
+
+	/**
+	 * Write all in-memory entries to disk now, creating the session file if needed. The lazy
+	 * first flush only fires once the session holds a user or assistant message; durable
+	 * journal writers (input custody) cannot wait for that, so they demand the flush here.
+	 * No-op when the session is not persisted or is already flushed.
+	 */
+	ensureFlushed(): void {
+		if (!this.persist || !this.sessionFile || this.flushed) return;
+		this._writeAllEntriesToNewFile();
+		this.flushed = true;
 	}
 
 	private _appendEntry(entry: SessionEntry): void {

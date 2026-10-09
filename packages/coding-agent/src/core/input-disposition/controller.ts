@@ -36,14 +36,17 @@ export class InputDispositionController {
 	private _deferredIdleEvalScheduled = false;
 	private readonly _recorder: InputDispositionRecorder;
 	private readonly _executeIdleWorkEvaluation: () => Promise<EvaluateIdleWorkResult>;
+	private readonly _reportError: (error: unknown) => void;
 
 	constructor(
 		getSessionManager: () => SessionManager,
 		emitSessionEvent: (event: InputDispositionEvent) => void,
 		executeIdleWorkEvaluation: () => Promise<EvaluateIdleWorkResult>,
+		reportError: (error: unknown) => void,
 	) {
 		this._recorder = new InputDispositionRecorder(getSessionManager, emitSessionEvent);
 		this._executeIdleWorkEvaluation = executeIdleWorkEvaluation;
+		this._reportError = reportError;
 		this._currentGeneration = randomUUID();
 	}
 
@@ -172,7 +175,14 @@ export class InputDispositionController {
 			this._occurrences.set(occurrenceId, fullOccurrence);
 			this._recorder.persist(fullOccurrence, "occurrence", options.text);
 			this._recorder.emit(fullOccurrence);
-			return { occurrence: fullOccurrence, isFull: true };
+			// Overflow stays actionable in-session: held custody carries the admission-full
+			// fact so the owner can release it here instead of restarting. It never counts
+			// as a pending admission and is never dispatched automatically.
+			this.holdInput(occurrenceId, options.text, options.images);
+			this.transition(occurrenceId, "held", {
+				detail: "admission_full: pending limit reached; owner release required",
+			});
+			return { occurrence: this._occurrences.get(occurrenceId), isFull: true };
 		}
 
 		const occurrenceId = this.nextOccurrenceId();
@@ -403,7 +413,11 @@ export class InputDispositionController {
 						}
 					})
 					.catch((error) => {
-						console.error("Idle work evaluation failed:", error);
+						// A damaged custody owner or failing idle evaluation must stay visible:
+						// route through the session's real error channel, never a bare console
+						// line and never a blind retry. The next settle or admission event may
+						// schedule a fresh evaluation; this failure itself is terminal here.
+						this._reportError(error);
 					});
 			} else if (!this._disposed) this._deferredIdleEvalScheduled = true;
 		}, 0);
