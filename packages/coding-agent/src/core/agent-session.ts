@@ -2050,11 +2050,14 @@ export class AgentSession {
 		}
 
 		// Native input disposition: bind the occurrence before hooks when ingress is marked.
+		// Explicit ingress always gets custody so owner-directed delivery keeps occurrence
+		// identity, holds, readback and releases even with the automatic gate off; automatic
+		// ingress is admitted only while the controller is enabled.
 		const ingress = options?.source && options.source !== "interactive" ? undefined : options?.ingress;
 		let dispositionOccurrence: AdmittedOccurrence | undefined;
 		let admissionFull = false;
 		let admissionError: unknown;
-		if (this._inputDispositionController.enabled && ingress) {
+		if (ingress && (this._inputDispositionController.enabled || ingress === "explicit")) {
 			try {
 				const admission = this._inputDispositionController.admitOccurrence({
 					text,
@@ -2475,39 +2478,19 @@ export class AgentSession {
 	}
 
 	/**
-	 * Explicit owner delivery of new text. With custody enabled it goes through
-	 * the disposition dispatcher (admission, held conflicts, readback). With
-	 * custody retired (setEnabled(false)) it still delivers through the native
-	 * legacy queues, so explicit controls never depend on the automatic gate:
-	 * send_now while busy refuses instead of silently downgrading to steer.
+	 * Explicit owner delivery of new text. It always enters the same native
+	 * admission and dispatcher: the occurrence is admitted once and carries
+	 * custody, conflict holds, readback and releases regardless of whether
+	 * automatic classification is enabled. Automatic ingress binding and the
+	 * classifier stay gated behind setEnabled; explicit requests never depend
+	 * on them and the enable flag is never toggled around a dispatch.
 	 */
 	private async _dispatchInputExplicit(text: string, disposition: InputDisposition): Promise<void> {
-		if (this._inputDispositionController.enabled) {
-			await this.prompt(text, {
-				ingress: "explicit",
-				disposition,
-				streamingBehavior: disposition === "follow_up" ? "followUp" : "steer",
-			});
-			return;
-		}
-		switch (disposition) {
-			case "steer":
-				await this.steer(text);
-				return;
-			case "follow_up":
-				await this.followUp(text);
-				return;
-			case "send_now":
-				if (this.isStreaming || this._isAgentRunActive) {
-					throw new Error("A run is active; send_now needs idle. Use /steer or /interrupt-now.");
-				}
-				await this.prompt(text);
-				return;
-			case "interrupt_now":
-				await this.abort();
-				await this.prompt(text);
-				return;
-		}
+		await this.prompt(text, {
+			ingress: "explicit",
+			disposition,
+			streamingBehavior: disposition === "follow_up" ? "followUp" : "steer",
+		});
 	}
 
 	/** interrupt_now: durable replacement record, abort, await real idle, revalidate, dispatch the same replacement once. */
@@ -2580,11 +2563,11 @@ export class AgentSession {
 			this._dispatcherBusy = false;
 		}
 
-		// Revalidate before dispatching the SAME admitted replacement.
-		if (
-			!this._inputDispositionController.enabled ||
-			occ.sessionGeneration !== this._inputDispositionController.currentGeneration
-		) {
+		// Revalidate before dispatching the SAME admitted replacement. Generation fencing
+		// alone decides staleness: explicit occurrences admitted under the current
+		// generation dispatch even with the automatic gate off, while anything admitted
+		// before a mode or session generation bump is stale and stays held.
+		if (occ.sessionGeneration !== this._inputDispositionController.currentGeneration) {
 			this._inputDispositionController.holdInput(occ.occurrenceId, occ.text, occ.images);
 			this._inputDispositionController.transition(occ.occurrenceId, "held", {
 				disposition: "interrupt_now",
