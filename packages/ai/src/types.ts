@@ -546,6 +546,7 @@ export interface SystemMessage {
 export interface UserMessage {
 	role: "user";
 	content: string | (TextContent | ImageContent)[];
+	inputOccurrenceId?: string;
 	timestamp: number; // Unix timestamp in milliseconds
 }
 

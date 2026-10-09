@@ -65,6 +65,9 @@ export interface InputDispositionJournalEntry {
 	disposition?: InputDisposition;
 	queue?: string;
 	text?: string;
+	images?: ImageContent[];
+	sessionGeneration?: string;
+	revision?: number;
 	detail?: string;
 	at: number;
 }

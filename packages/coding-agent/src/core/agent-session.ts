@@ -333,6 +333,8 @@ export interface PromptOptions {
 	source?: InputSource;
 	/** Ingress classification for native input disposition. Absence means no automatic classification, idle included. */
 	ingress?: "automatic" | "explicit";
+	/** Explicit owner delivery choice, bypassing automatic classification. */
+	disposition?: InputDisposition;
 	/** Internal hook used by RPC mode to observe how an accepted prompt was dispatched. Not called if the prompt is rejected. */
 	preflightResult?: (disposition: PromptDisposition) => void;
 }
@@ -410,7 +412,10 @@ export class AgentSession {
 	/** Native input disposition controller (enabled via pi.setInputDispositionEnabled). */
 	private readonly _inputDispositionController = new InputDispositionController(
 		() => this.sessionManager,
-		(event) => this._emit(event),
+		(event) => {
+			this._emit(event);
+			void this._extensionRunner?.emit(event);
+		},
 		() => this._evaluateIdleWork(),
 	);
 	/** True while the disposition dispatcher itself drives an abort, so abort() does not invalidate its own admission. */
@@ -1183,6 +1188,11 @@ export class AgentSession {
 				// Regular LLM message - persist as SessionMessageEntry
 				entryId = this.sessionManager.appendMessage(event.message);
 			}
+			if (entryId && event.message.role === "user" && event.message.inputOccurrenceId) {
+				this._inputDispositionController.transition(event.message.inputOccurrenceId, "delivered", {
+					detail: `user_entry:${entryId}`,
+				});
+			}
 			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
@@ -1413,6 +1423,7 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._inputDispositionController.dispose();
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -1922,6 +1933,7 @@ export class AgentSession {
 	}
 
 	private async _runBeforeSettleBoundary(): Promise<boolean> {
+		if (this._inputDispositionController.pendingAdmissionCount > 0) return false;
 		if (!this._extensionRunner.hasHandlers("agent_before_settle")) return this.agent.hasQueuedMessages();
 		this._isBeforeSettle = true;
 		this._abortDuringBeforeSettle = false;
@@ -1969,8 +1981,8 @@ export class AgentSession {
 		}
 		if (inputResult.action === "disposition") {
 			return {
-				text,
-				images,
+				text: inputResult.text ?? text,
+				images: inputResult.images ?? images,
 				claim: { occurrenceId: inputResult.occurrenceId, disposition: inputResult.disposition },
 			};
 		}
@@ -2036,79 +2048,124 @@ export class AgentSession {
 		}
 
 		// Native input disposition: bind the occurrence before hooks when ingress is marked.
-		const ingress = options?.ingress;
+		const ingress = options?.source && options.source !== "interactive" ? undefined : options?.ingress;
 		let dispositionOccurrence: AdmittedOccurrence | undefined;
 		let admissionFull = false;
+		let admissionError: unknown;
 		if (this._inputDispositionController.enabled && ingress) {
-			const admission = this._inputDispositionController.admitOccurrence({
-				text,
-				images: options?.images,
-				ingress,
-				streamingBehavior: this.isStreaming ? options?.streamingBehavior : undefined,
-			});
-			if (admission.isFull || !admission.occurrence) {
-				admissionFull = true;
-				dispositionOccurrence = admission.occurrence;
-			} else {
-				dispositionOccurrence = admission.occurrence;
-			}
-		}
-		const inputMetadata: InputEventMetadata | undefined = dispositionOccurrence
-			? {
-					occurrenceId: dispositionOccurrence.occurrenceId,
-					ingress: dispositionOccurrence.ingress,
-					runId: dispositionOccurrence.capturedRunId,
-					sessionGeneration: dispositionOccurrence.sessionGeneration,
-					admission: admissionFull ? "full" : "granted",
+			try {
+				const admission = this._inputDispositionController.admitOccurrence({
+					text,
+					images: options?.images,
+					ingress,
+					streamingBehavior: this.isStreaming ? options?.streamingBehavior : undefined,
+				});
+				if (admission.isFull || !admission.occurrence) {
+					admissionFull = true;
+					dispositionOccurrence = admission.occurrence;
+				} else {
+					dispositionOccurrence = admission.occurrence;
 				}
-			: undefined;
-
-		// Emit input event for extension interception (before skill/template expansion)
-		const processedInput = await this._runInputHandlers(
-			text,
-			options?.images,
-			options?.source ?? "interactive",
-			this.isStreaming ? options?.streamingBehavior : undefined,
-			inputMetadata,
-		);
-		if (!processedInput || admissionFull) {
-			// Admission-exhausted inputs stay in native custody with a visible busy outcome;
-			// the gate must not classify or dispatch them.
-			preflightResult?.("handled");
-			return;
+			} catch (error) {
+				admissionError = error;
+			}
+			if (admissionError) {
+				this._extensionRunner.emitError({
+					extensionPath: "<input-disposition>",
+					event: "input",
+					error: `Input custody failed; native delivery continues: ${admissionError instanceof Error ? admissionError.message : String(admissionError)}`,
+				});
+			}
 		}
-		const { text: currentText, images: currentImages } = processedInput;
-		if (processedInput.claim && dispositionOccurrence) {
-			// Declarative claim: the owning dispatcher executes it once; input hooks do not re-run.
-			preflightResult?.("handled");
-			await this._executeClaimedDisposition(dispositionOccurrence, processedInput.claim.disposition);
-			return;
-		}
+		try {
+			const inputMetadata: InputEventMetadata | undefined = dispositionOccurrence
+				? {
+						occurrenceId: dispositionOccurrence.occurrenceId,
+						ingress: dispositionOccurrence.ingress,
+						runId: dispositionOccurrence.capturedRunId,
+						sessionGeneration: dispositionOccurrence.sessionGeneration,
+						admission: admissionFull ? "full" : "granted",
+					}
+				: undefined;
 
-		// Expand skill commands (/skill:name args) and prompt templates (/template args)
-		let expandedText = currentText;
-		if (expandPromptTemplates) {
-			expandedText = this._expandSkillCommand(expandedText);
-			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-		}
-
-		// If streaming, queue via steer() or followUp() based on option
-		if (this.isStreaming) {
-			if (!options?.streamingBehavior) {
-				throw new Error(
-					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+			// Emit input event for extension interception (before skill/template expansion)
+			const processedInput = await this._runInputHandlers(
+				text,
+				options?.images,
+				options?.source ?? "interactive",
+				this.isStreaming ? options?.streamingBehavior : undefined,
+				inputMetadata,
+			);
+			if (
+				dispositionOccurrence &&
+				(dispositionOccurrence.sessionGeneration !== this._inputDispositionController.currentGeneration ||
+					dispositionOccurrence.state === "held" ||
+					dispositionOccurrence.state === "cancelled")
+			) {
+				preflightResult?.("handled");
+				return;
+			}
+			if (!processedInput || admissionFull) {
+				if (dispositionOccurrence && !admissionFull)
+					this._inputDispositionController.transition(dispositionOccurrence.occurrenceId, "blocked", {
+						detail: "consumed_by_handler",
+					});
+				// Admission-exhausted inputs stay in native custody with a visible busy outcome;
+				// the gate must not classify or dispatch them.
+				preflightResult?.("handled");
+				return;
+			}
+			const { text: currentText, images: currentImages } = processedInput;
+			const requestedDisposition = processedInput.claim?.disposition ?? options?.disposition;
+			if (requestedDisposition && dispositionOccurrence) {
+				// Declarative claim: the owning dispatcher executes it once; input hooks do not re-run.
+				preflightResult?.("handled");
+				await this._executeClaimedDisposition(
+					{ ...dispositionOccurrence, text: currentText, images: currentImages },
+					requestedDisposition,
 				);
+				return;
 			}
-			if (options.streamingBehavior === "followUp") {
-				await this._queueFollowUp(expandedText, currentImages);
-			} else {
-				await this._queueSteer(expandedText, currentImages);
-			}
-			preflightResult?.("queued");
-			return;
-		}
 
-		await this._runPromptPipeline(expandedText, currentImages, () => preflightResult?.("started"));
+			// Expand skill commands (/skill:name args) and prompt templates (/template args)
+			let expandedText = currentText;
+			if (expandPromptTemplates) {
+				expandedText = this._expandSkillCommand(expandedText);
+				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+			}
+
+			// If streaming, queue via steer() or followUp() based on option
+			if (this.isStreaming) {
+				if (!options?.streamingBehavior) {
+					throw new Error(
+						"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+					);
+				}
+				if (options.streamingBehavior === "followUp") {
+					await this._queueFollowUp(expandedText, currentImages, dispositionOccurrence?.occurrenceId);
+				} else {
+					await this._queueSteer(expandedText, currentImages, dispositionOccurrence?.occurrenceId);
+				}
+				preflightResult?.("queued");
+				return;
+			}
+
+			await this._runPromptPipeline(
+				expandedText,
+				currentImages,
+				() => {
+					if (dispositionOccurrence)
+						this._inputDispositionController.finishInputDisposition(dispositionOccurrence.occurrenceId);
+					preflightResult?.("started");
+				},
+				dispositionOccurrence?.occurrenceId,
+			);
+		} finally {
+			if (dispositionOccurrence) {
+				this._inputDispositionController.finishInputDisposition(dispositionOccurrence.occurrenceId);
+				this._inputDispositionController.scheduleDeferredIdleEvaluation();
+			}
+		}
 	}
 
 	/**
@@ -2120,6 +2177,7 @@ export class AgentSession {
 		expandedText: string,
 		currentImages: ImageContent[] | undefined,
 		onStart?: () => void,
+		occurrenceId?: string,
 	): Promise<void> {
 		// Flush any pending bash and custom messages before the new prompt
 		this._flushPendingBashMessages();
@@ -2178,6 +2236,7 @@ export class AgentSession {
 		messages.push({
 			role: "user",
 			content: userContent,
+			inputOccurrenceId: occurrenceId,
 			timestamp: Date.now(),
 		});
 
@@ -2202,6 +2261,7 @@ export class AgentSession {
 		this._runSystemPromptOptions = result.systemPromptOptions;
 		if (updateMessage) messages.unshift(updateMessage);
 
+		this._reservedInputDispatchCheck(occurrenceId);
 		onStart?.();
 		await this._runAgentPrompt(messages);
 	}
@@ -2210,9 +2270,21 @@ export class AgentSession {
 	// Input disposition dispatcher
 	// =========================================================================
 
+	invalidateInputDisposition(): void {
+		this._inputDispositionController.bumpGeneration("session_replacement");
+	}
+
 	/** Whether native input disposition mode is currently enabled. */
 	isInputDispositionEnabled(): boolean {
 		return this._inputDispositionController.enabled;
+	}
+
+	private _reservedInputDispatchCheck(occurrenceId?: string): void {
+		if (!occurrenceId) return;
+		const occurrence = this._inputDispositionController.getOccurrence(occurrenceId);
+		if (!occurrence || occurrence.sessionGeneration !== this._inputDispositionController.currentGeneration)
+			throw new Error("Input target invalidated before dispatch");
+		if (this._isAgentRunActive || this.isStreaming) throw new Error("Newer run started during provider admission");
 	}
 
 	/** Current disposition record for one occurrence, as a plain event snapshot. */
@@ -2237,6 +2309,7 @@ export class AgentSession {
 
 	/** Awaited idle work pickup: runs the normal before-settle work-queue evaluation once when idle. */
 	private async _evaluateIdleWork(): Promise<EvaluateIdleWorkResult> {
+		this._inputDispositionController.recover();
 		if (!this.isIdle || this._isAgentRunActive) {
 			this._inputDispositionController.scheduleDeferredIdleEvaluation();
 			return { started: false, ranWork: false, reason: "busy" };
@@ -2278,7 +2351,10 @@ export class AgentSession {
 			});
 			return "rejected";
 		}
-		if (held.sessionId !== this.sessionManager.getSessionId()) {
+		if (
+			held.sessionId !== this.sessionManager.getSessionId() ||
+			held.sessionGeneration !== this._inputDispositionController.currentGeneration
+		) {
 			this._inputDispositionController.transition(occurrenceId, "blocked", { disposition, detail: "stale_session" });
 			return "rejected";
 		}
@@ -2291,13 +2367,21 @@ export class AgentSession {
 		}
 		this._inputDispositionController.takeHeldInput(occurrenceId);
 		this._inputDispositionController.transition(occurrenceId, "released", { disposition });
-		const admitted: AdmittedOccurrence = { ...occ, text: held.text, images: held.images };
+		// Explicit release retargets the occurrence to its new choice and the current run.
+		const capturedRunId = this._inputDispositionController.activeRunId;
+		this._inputDispositionController.retarget(occurrenceId, { disposition, capturedRunId });
+		const admitted: AdmittedOccurrence = { ...occ, disposition, capturedRunId, text: held.text, images: held.images };
 		await this._executeClaimedDisposition(admitted, disposition);
 		return "released";
 	}
 
 	/** Execute one claimed disposition exactly once against the original occurrence. */
 	private async _executeClaimedDisposition(occ: AdmittedOccurrence, disposition: InputDisposition): Promise<void> {
+		if (
+			occ.sessionGeneration !== this._inputDispositionController.currentGeneration ||
+			occ.sessionId !== this.sessionManager.getSessionId()
+		)
+			throw new Error("Stale input disposition target");
 		try {
 			switch (disposition) {
 				case "send_now": {
@@ -2318,6 +2402,14 @@ export class AgentSession {
 				case "follow_up": {
 					const capturedRunValid =
 						occ.capturedRunId !== undefined && occ.capturedRunId === this._inputDispositionController.activeRunId;
+					if ((this.isStreaming || this._isAgentRunActive) && !capturedRunValid) {
+						this._inputDispositionController.holdInput(occ.occurrenceId, occ.text, occ.images);
+						this._inputDispositionController.transition(occ.occurrenceId, "conflict", {
+							disposition,
+							detail: "stale_run",
+						});
+						return;
+					}
 					if ((this.isStreaming || this._isAgentRunActive) && capturedRunValid) {
 						// Live run: queue without re-running input hooks; queue order stays native.
 						let expandedText = this._expandSkillCommand(occ.text);
@@ -2335,8 +2427,12 @@ export class AgentSession {
 					}
 					// Idle or captured run already ended naturally: normalize through native queue
 					// order (steering drains before follow-ups) and start one normal run.
-					this._inputDispositionController.transition(occ.occurrenceId, "dispatched", { disposition });
-					await this._dispatchAdmittedOccurrence(occ);
+					let normalizedText = this._expandSkillCommand(occ.text);
+					normalizedText = expandPromptTemplate(normalizedText, [...this.promptTemplates]);
+					if (disposition === "steer") await this._queueSteer(normalizedText, occ.images, occ.occurrenceId);
+					else await this._queueFollowUp(normalizedText, occ.images, occ.occurrenceId);
+					this._inputDispositionController.finishInputDisposition(occ.occurrenceId);
+					await this._runAgentLoop(() => this.agent.continue());
 					return;
 				}
 				case "interrupt_now": {
@@ -2345,38 +2441,67 @@ export class AgentSession {
 				}
 			}
 		} catch (err) {
-			this._inputDispositionController.transition(occ.occurrenceId, "failed", {
-				disposition,
-				detail: err instanceof Error ? err.message : String(err),
+			// An occurrence already delivered or queued is not retryable: a late error after
+			// consumption must never make it replayable. Authoritative state decides.
+			const current = this._inputDispositionController.getOccurrence(occ.occurrenceId);
+			const advanced = current && (current.state === "delivered" || current.state === "queued");
+			this._extensionRunner.emitError({
+				extensionPath: "<input-disposition>",
+				event: "input",
+				error: `Disposition ${disposition} for ${occ.occurrenceId} failed in state ${current?.state ?? "unknown"}: ${err instanceof Error ? err.message : String(err)}`,
 			});
+			if (!advanced) {
+				this._inputDispositionController.holdInput(occ.occurrenceId, occ.text, occ.images);
+				this._inputDispositionController.transition(occ.occurrenceId, "failed", {
+					disposition,
+					detail: err instanceof Error ? err.message : String(err),
+				});
+			}
+			throw err;
 		}
 	}
 
 	/** interrupt_now: durable replacement record, abort, await real idle, revalidate, dispatch the same replacement once. */
 	private async _executeInterruptNow(occ: AdmittedOccurrence): Promise<void> {
+		if (
+			(this._isAgentRunActive || this.isStreaming) &&
+			occ.capturedRunId !== this._inputDispositionController.activeRunId
+		) {
+			this._inputDispositionController.holdInput(occ.occurrenceId, occ.text, occ.images);
+			this._inputDispositionController.transition(occ.occurrenceId, "conflict", { detail: "stale_run" });
+			return;
+		}
+		this._inputDispositionController.reserveReplacement(occ.occurrenceId);
+		if (occ.ingress === "explicit") this._inputDispositionController.invalidateInFlightDueToInterrupt();
 		this._inputDispositionController.transition(occ.occurrenceId, "cancel_requested", {
 			disposition: "interrupt_now",
 		});
-		this._inputDispositionController.reserveReplacement(occ.occurrenceId);
 		this._inputDispositionController.transition(occ.occurrenceId, "waiting_idle", { disposition: "interrupt_now" });
 
 		// Older steering is held visibly; follow-ups stay queued behind the replacement run.
-		const heldSteering = [...this._steeringMessages];
+		const heldSteering = this.agent.takeSteeringMessages();
 		if (heldSteering.length > 0) {
 			this._steeringMessages = [];
-			this.agent.clearSteeringQueue();
-			for (const text of heldSteering) {
-				const held = this._inputDispositionController.admitOccurrence({
-					text,
-					ingress: "explicit",
-					streamingBehavior: "steer",
+			for (const message of heldSteering) {
+				if (message.role !== "user") throw new Error("Steering custody is not a user message");
+				const text = contentText(message.content, "");
+				const images =
+					typeof message.content === "string"
+						? undefined
+						: message.content.filter((item): item is ImageContent => item.type === "image");
+				const occurrence = message.inputOccurrenceId
+					? this._inputDispositionController.getOccurrence(message.inputOccurrenceId)
+					: this._inputDispositionController.admitOccurrence({
+							text,
+							images,
+							ingress: "explicit",
+							streamingBehavior: "steer",
+						}).occurrence;
+				if (!occurrence) throw new Error("Missing steering custody");
+				this._inputDispositionController.holdInput(occurrence.occurrenceId, text, images);
+				this._inputDispositionController.transition(occurrence.occurrenceId, "held", {
+					detail: "held_by_replacement",
 				});
-				if (held.occurrence) {
-					this._inputDispositionController.holdInput(held.occurrence.occurrenceId, text);
-					this._inputDispositionController.transition(held.occurrence.occurrenceId, "held", {
-						detail: "held_by_replacement",
-					});
-				}
 			}
 			this._emitQueueUpdate();
 		}
@@ -2423,7 +2548,15 @@ export class AgentSession {
 	private async _dispatchAdmittedOccurrence(occ: AdmittedOccurrence): Promise<void> {
 		let expandedText = this._expandSkillCommand(occ.text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-		await this._runPromptPipeline(expandedText, occ.images);
+		await this._runPromptPipeline(
+			expandedText,
+			occ.images,
+			() => {
+				this._inputDispositionController.finishInputDisposition(occ.occurrenceId);
+				this._inputDispositionController.clearReservedReplacement();
+			},
+			occ.occurrenceId,
+		);
 	}
 
 	/**
@@ -2530,6 +2663,20 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: { source?: InputSource },
 	): Promise<QueuedInputDisposition> {
+		if (this._inputDispositionController.enabled) {
+			let result: QueuedInputDisposition = "handled";
+			await this.prompt(text, {
+				images,
+				source: options?.source ?? "interactive",
+				ingress: "explicit",
+				disposition: "steer",
+				streamingBehavior: "steer",
+				preflightResult: (outcome) => {
+					if (outcome !== "handled") result = "queued";
+				},
+			});
+			return result;
+		}
 		return this._queueUserInput(text, images, "steer", options?.source ?? "interactive");
 	}
 
@@ -2546,6 +2693,16 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: { source?: InputSource },
 	): Promise<QueuedInputDisposition> {
+		if (this._inputDispositionController.enabled) {
+			await this.prompt(text, {
+				images,
+				source: options?.source ?? "interactive",
+				ingress: "explicit",
+				disposition: "follow_up",
+				streamingBehavior: "followUp",
+			});
+			return "queued";
+		}
 		return this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
 	}
 
@@ -2553,6 +2710,12 @@ export class AgentSession {
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
 	private async _queueSteer(text: string, images?: ImageContent[], occurrenceId?: string): Promise<void> {
+		if (occurrenceId)
+			this._inputDispositionController.transition(occurrenceId, "queued", {
+				disposition: "steer",
+				queue: "steer",
+				queuePosition: this._steeringMessages.length + 1,
+			});
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -2562,33 +2725,28 @@ export class AgentSession {
 		this.agent.steer({
 			role: "user",
 			content,
+			inputOccurrenceId: occurrenceId,
 			timestamp: Date.now(),
 		});
-		if (occurrenceId) {
-			this._inputDispositionController.transition(occurrenceId, "queued", {
-				queue: "steer",
-				queuePosition: this._steeringMessages.length,
-			});
-		}
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
 	private async _queueFollowUp(text: string, images?: ImageContent[], occurrenceId?: string): Promise<void> {
+		if (occurrenceId)
+			this._inputDispositionController.transition(occurrenceId, "queued", {
+				disposition: "follow_up",
+				queue: "follow_up",
+				queuePosition: this._followUpMessages.length + 1,
+			});
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.followUp({ role: "user", content, timestamp: Date.now() });
-		if (occurrenceId) {
-			this._inputDispositionController.transition(occurrenceId, "queued", {
-				queue: "follow_up",
-				queuePosition: this._followUpMessages.length,
-			});
-		}
+		this.agent.followUp({ role: "user", content, inputOccurrenceId: occurrenceId, timestamp: Date.now() });
 	}
 
 	/**
@@ -3774,6 +3932,12 @@ export class AgentSession {
 				setInputDispositionEnabled: (enabled) => this._inputDispositionController.setEnabled(enabled),
 				requestIdleWorkEvaluation: () => this._evaluateIdleWork(),
 				getQueuedInput: () => this._inputDispositionController.getQueuedInput(),
+				dispatchInput: (text: string, disposition: InputDisposition) =>
+					this.prompt(text, {
+						ingress: "explicit",
+						disposition,
+						streamingBehavior: disposition === "follow_up" ? "followUp" : "steer",
+					}),
 			},
 			{
 				getModel: () => this.model,
@@ -3816,6 +3980,12 @@ export class AgentSession {
 					getQueuedInput: () => this._getQueuedInputRefs(),
 					evaluateIdleWork: () => this._evaluateIdleWork(),
 					releaseHeldInput: (occurrenceId, disposition) => this._releaseHeldInput(occurrenceId, disposition),
+					dispatchInput: (text, disposition) =>
+						this.prompt(text, {
+							ingress: "explicit",
+							disposition,
+							streamingBehavior: disposition === "follow_up" ? "followUp" : "steer",
+						}),
 				},
 			},
 			{

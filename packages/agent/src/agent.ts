@@ -305,6 +305,13 @@ export class Agent {
 		this.followUpQueue.enqueue(message);
 	}
 
+	/** Remove and return steering custody, preserving message identity and attachments. */
+	takeSteeringMessages(): AgentMessage[] {
+		const messages: AgentMessage[] = [];
+		while (this.steeringQueue.hasItems()) messages.push(...this.steeringQueue.drain());
+		return messages;
+	}
+
 	/** Remove all queued steering messages. */
 	clearSteeringQueue(): void {
 		this.steeringQueue.clear();

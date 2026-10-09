@@ -982,6 +982,10 @@ export class ExtensionRunner {
 							runner.assertActive();
 							return runner.inputDispositionActions!.releaseHeldInput(occurrenceId, disposition);
 						},
+						dispatchInput: (text: string, disposition: InputDisposition) => {
+							runner.assertActive();
+							return runner.inputDispositionActions!.dispatchInput(text, disposition);
+						},
 					}
 				: {}),
 		};
@@ -1619,16 +1623,19 @@ export class ExtensionRunner {
 				}
 			}
 			if (claim) {
-				return { action: "disposition", occurrenceId: claim.occurrenceId, disposition: claim.disposition };
+				return {
+					action: "disposition",
+					occurrenceId: claim.occurrenceId,
+					disposition: claim.disposition,
+					text: currentText,
+					images: currentImages,
+				};
 			}
 			return currentText !== text || currentImages !== images
 				? { action: "transform", text: currentText, images: currentImages }
 				: { action: "continue" };
 		} finally {
-			// Release the single-flight admission slot when this input dispatch pass completes
-			if (metadata?.occurrenceId) {
-				this.inputDispositionActions?.finish(metadata.occurrenceId);
-			}
+			// The session releases admission after dispatch/handling, not before reservation.
 		}
 	}
 }

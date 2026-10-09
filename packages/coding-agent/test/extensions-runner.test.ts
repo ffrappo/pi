@@ -98,6 +98,7 @@ describe("ExtensionRunner", () => {
 		setInputDispositionEnabled: () => {},
 		requestIdleWorkEvaluation: async () => ({ started: false, ranWork: false }),
 		getQueuedInput: () => [],
+		dispatchInput: async () => {},
 	};
 
 	const extensionContextActions: ExtensionContextActions = {

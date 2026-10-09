@@ -3381,7 +3381,10 @@ export class InteractiveMode {
 			if (this.session.isStreaming) {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.session.prompt(text, { streamingBehavior: "steer", ingress: "explicit" });
+				await this.session.prompt(text, {
+					streamingBehavior: "steer",
+					ingress: this.session.isInputDispositionEnabled() ? "automatic" : undefined,
+				});
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				return;
@@ -3436,6 +3439,10 @@ export class InteractiveMode {
 				} else {
 					this.clearStatusIndicator();
 				}
+				this.ui.requestRender();
+				break;
+
+			case "input_disposition":
 				this.ui.requestRender();
 				break;
 

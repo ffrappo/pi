@@ -188,6 +188,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		setInputDispositionEnabled: notInitialized,
 		requestIdleWorkEvaluation: () => Promise.reject(new Error("Extension runtime not initialized")),
 		getQueuedInput: () => [],
+		dispatchInput: () => Promise.reject(new Error("Extension runtime not initialized")),
 		flagValues: new Map(),
 		pendingProviderRegistrations: [],
 		pendingNativeProviderRegistrations: [],

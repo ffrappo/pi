@@ -3,9 +3,11 @@
  * generation guards, held custody, replacement reservation, idle pickup).
  */
 
+import { randomUUID } from "node:crypto";
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { SessionManager } from "../session-manager.ts";
 import { InputDispositionRecorder } from "./recorder.ts";
+import { recoverInputOccurrences } from "./recovery.ts";
 import type {
 	AdmittedOccurrence,
 	EvaluateIdleWorkResult,
@@ -21,9 +23,10 @@ import { MAX_PENDING_AUTOMATIC_ADMISSIONS } from "./types.ts";
 
 export class InputDispositionController {
 	private _enabled = false;
-	private _occurrenceSequence = 0;
-	private _generationSequence = 0;
 	private _currentGeneration: string;
+	private readonly _pending = new Set<string>();
+	private _disposed = false;
+	private _idleTimer: ReturnType<typeof setTimeout> | undefined;
 	private readonly _occurrences = new Map<string, AdmittedOccurrence>();
 	private readonly _heldInputs = new Map<string, HeldSteeringInput>();
 	private _inFlightAdmission: InFlightAdmission | undefined;
@@ -41,7 +44,22 @@ export class InputDispositionController {
 	) {
 		this._recorder = new InputDispositionRecorder(getSessionManager, emitSessionEvent);
 		this._executeIdleWorkEvaluation = executeIdleWorkEvaluation;
-		this._currentGeneration = `gen_${Date.now()}_${++this._generationSequence}`;
+		this._currentGeneration = randomUUID();
+	}
+
+	dispose(): void {
+		this.bumpGeneration("session_replaced");
+		this._disposed = true;
+		if (this._idleTimer) clearTimeout(this._idleTimer);
+	}
+
+	recover(): void {
+		for (const occ of recoverInputOccurrences(this._recorder.sessionManager, this._currentGeneration)) {
+			if (this._occurrences.has(occ.occurrenceId)) continue;
+			this._occurrences.set(occ.occurrenceId, occ);
+			if (occ.state === "held") this.holdInput(occ.occurrenceId, occ.text, occ.images);
+			this._recorder.emit(occ);
+		}
 	}
 
 	get enabled(): boolean {
@@ -51,6 +69,7 @@ export class InputDispositionController {
 	setEnabled(enabled: boolean): void {
 		if (this._enabled === enabled) return;
 		this._enabled = enabled;
+		if (enabled) this.recover();
 		if (!enabled) {
 			this.bumpGeneration("mode_off");
 		}
@@ -61,7 +80,10 @@ export class InputDispositionController {
 	}
 
 	bumpGeneration(reason?: string): void {
-		this._currentGeneration = `gen_${Date.now()}_${++this._generationSequence}`;
+		this._currentGeneration = randomUUID();
+		this._pending.clear();
+		this._deferredIdleEvalScheduled = false;
+		this._reservedReplacementOccurrenceId = undefined;
 		// Invalidate all pending admissions waiting or in-flight
 		if (this._inFlightAdmission) {
 			this._inFlightAdmission.invalidated = true;
@@ -91,11 +113,11 @@ export class InputDispositionController {
 	}
 
 	nextOccurrenceId(): string {
-		return `occ_${Date.now()}_${++this._occurrenceSequence}`;
+		return `occ_${randomUUID()}`;
 	}
 
 	nextRunId(): string {
-		return `run_${Date.now()}_${++this._occurrenceSequence}`;
+		return `run_${randomUUID()}`;
 	}
 
 	occurrences(): IterableIterator<AdmittedOccurrence> {
@@ -116,10 +138,7 @@ export class InputDispositionController {
 	}
 
 	get pendingAdmissionCount(): number {
-		let count = 0;
-		if (this._inFlightAdmission) count++;
-		count += this._admissionWaitQueue.length;
-		return count;
+		return this._pending.size + (this._reservedReplacementOccurrenceId ? 1 : 0);
 	}
 
 	isAdmissionFull(): boolean {
@@ -132,6 +151,7 @@ export class InputDispositionController {
 		ingress?: InputIngress;
 		streamingBehavior?: "steer" | "followUp";
 	}): { occurrence?: AdmittedOccurrence; isFull: boolean } {
+		if (this._disposed) throw new Error("Input session was replaced");
 		const isAutomatic = options.ingress === "automatic";
 		if (isAutomatic && this.isAdmissionFull()) {
 			const occurrenceId = this.nextOccurrenceId();
@@ -170,6 +190,7 @@ export class InputDispositionController {
 			createdAt: Date.now(),
 		};
 		this._occurrences.set(occurrenceId, occurrence);
+		this._pending.add(occurrenceId);
 		this._recorder.persist(occurrence, "occurrence");
 		this._recorder.emit(occurrence);
 		return { occurrence, isFull: false };
@@ -182,15 +203,7 @@ export class InputDispositionController {
 		}
 
 		if (!this._inFlightAdmission) {
-			let gateResolver: (granted: "granted" | "invalidated") => void = () => {};
-			void new Promise<"granted" | "invalidated">((res) => {
-				gateResolver = res;
-			});
-			this._inFlightAdmission = {
-				occurrenceId,
-				resolveGate: gateResolver,
-				invalidated: false,
-			};
+			this._inFlightAdmission = { occurrenceId, resolveGate: () => {}, invalidated: false };
 			this.transition(occurrenceId, "classifying");
 			return "granted";
 		}
@@ -211,6 +224,7 @@ export class InputDispositionController {
 	}
 
 	finishInputDisposition(occurrenceId: string): void {
+		this._pending.delete(occurrenceId);
 		if (this._inFlightAdmission && this._inFlightAdmission.occurrenceId === occurrenceId) {
 			this._inFlightAdmission = undefined;
 			this._drainNextAdmission();
@@ -220,6 +234,7 @@ export class InputDispositionController {
 				this._admissionWaitQueue.splice(idx, 1);
 			}
 		}
+		this._scheduleDeferredIdleEvaluationIfDue();
 	}
 
 	private _drainNextAdmission(): void {
@@ -300,6 +315,14 @@ export class InputDispositionController {
 		this._reservedReplacementOccurrenceId = undefined;
 	}
 
+	/** Rebind an occurrence to its explicit release choice and the current run target. */
+	retarget(occurrenceId: string, update: { disposition?: InputDisposition; capturedRunId?: string }): void {
+		const occ = this._occurrences.get(occurrenceId);
+		if (!occ) return;
+		if (update.disposition) occ.disposition = update.disposition;
+		occ.capturedRunId = update.capturedRunId;
+	}
+
 	getOccurrence(occurrenceId: string): AdmittedOccurrence | undefined {
 		return this._occurrences.get(occurrenceId);
 	}
@@ -336,7 +359,9 @@ export class InputDispositionController {
 		for (const occ of this._occurrences.values()) {
 			if (occ.sessionGeneration !== this._currentGeneration) continue;
 			if (occ.state === "queued") {
-				if (occ.disposition === "steer" || occ.streamingBehavior === "steer") {
+				// The explicit disposition is authoritative once set; streamingBehavior is only the pre-claim default.
+				const effective = occ.disposition ?? (occ.streamingBehavior === "followUp" ? "follow_up" : "steer");
+				if (effective === "steer") {
 					refs.push({ occurrenceId: occ.occurrenceId, queue: "steer", position: steerPos++ });
 				} else {
 					refs.push({ occurrenceId: occ.occurrenceId, queue: "follow_up", position: followUpPos++ });
@@ -360,19 +385,23 @@ export class InputDispositionController {
 
 	private _scheduleDeferredIdleEvaluationIfDue(): void {
 		if (!this._deferredIdleEvalScheduled) return;
-		if (this._activeRunId || this.pendingAdmissionCount > 0) return;
+		if (this._disposed || this._activeRunId || this.pendingAdmissionCount > 0) return;
 
 		this._deferredIdleEvalScheduled = false;
 		// Run from next event loop tick so any synchronous caller or settling finishes first
-		setTimeout(() => {
-			if (!this._activeRunId && this.pendingAdmissionCount === 0) {
-				void this._executeIdleWorkEvaluation().then((res) => {
-					if (!res.started && res.reason === "input_pending") {
-						// Chained re-arm if another admission appeared right before run
-						this._deferredIdleEvalScheduled = true;
-					}
-				});
-			}
+		this._idleTimer = setTimeout(() => {
+			if (!this._disposed && !this._activeRunId && this.pendingAdmissionCount === 0) {
+				void this._executeIdleWorkEvaluation()
+					.then((res) => {
+						if (!res.started && res.reason === "input_pending") {
+							// Chained re-arm if another admission appeared right before run
+							this._deferredIdleEvalScheduled = true;
+						}
+					})
+					.catch((error) => {
+						console.error("Idle work evaluation failed:", error);
+					});
+			} else if (!this._disposed) this._deferredIdleEvalScheduled = true;
 		}, 0);
 	}
 }

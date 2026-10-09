@@ -380,6 +380,8 @@ export interface ExtensionContext {
 	evaluateIdleWork?(): Promise<EvaluateIdleWorkResult>;
 	/** Explicitly release a held input with the given disposition. Rejected for stale session/generation or unknown ids. */
 	releaseHeldInput?(occurrenceId: string, disposition: InputDisposition): Promise<"released" | "rejected">;
+	/** Explicit owner delivery of new text: reserves and dispatches without automatic classification. */
+	dispatchInput?(text: string, disposition: InputDisposition): Promise<void>;
 	/** Gracefully shutdown pi and exit. Available in all contexts. */
 	shutdown(): void;
 	/** Get current context usage for the active model. */
@@ -1203,7 +1205,13 @@ export type InputEventResult =
 	| { action: "continue" }
 	| { action: "transform"; text: string; images?: ImageContent[] }
 	| { action: "handled" }
-	| { action: "disposition"; occurrenceId: string; disposition: InputDisposition };
+	| {
+			action: "disposition";
+			occurrenceId: string;
+			disposition: InputDisposition;
+			text?: string;
+			images?: ImageContent[];
+	  };
 
 // ============================================================================
 // Tool Events
@@ -2234,6 +2242,7 @@ export interface ExtensionActions {
 	setInputDispositionEnabled: (enabled: boolean) => void;
 	requestIdleWorkEvaluation: () => Promise<EvaluateIdleWorkResult>;
 	getQueuedInput: () => QueuedInputRef[];
+	dispatchInput: (text: string, disposition: InputDisposition) => Promise<void>;
 }
 
 /**
@@ -2275,6 +2284,11 @@ export interface InputDispositionContextActions {
 	getQueuedInput: () => QueuedInputRef[];
 	evaluateIdleWork: () => Promise<EvaluateIdleWorkResult>;
 	releaseHeldInput: (occurrenceId: string, disposition: InputDisposition) => Promise<"released" | "rejected">;
+	dispatchInput: (text: string, disposition: InputDisposition) => Promise<void>;
+}
+
+export interface QueuedInputDispatchContextActions {
+	dispatch: (text: string, disposition: InputDisposition) => Promise<void>;
 }
 
 /**
