@@ -4,11 +4,11 @@
 
 ### Added
 
-- Added `NotificationMessageComponent` for shared themed, wrapped notices in the host and extensions.
+- Added `NotificationMessageComponent` for shared themed, wrapped notices in the host and extensions. `NOTIFICATION_ENTRY` is a host-owned UI-only notice type with selected-branch warning/error display retention.
 
 ### Fixed
 
-- Render resource diagnostics, extension notifications and custom-renderer failures through the shared TUI notice component, even when an extension fails to load. Custom-message renderer errors remain visible instead of silently rendering the default message.
+- Render resource diagnostics, extension notifications and custom-renderer failures through the shared TUI notice component, even when an extension fails to load. Custom-message and tool renderer errors remain visible alongside their original content, including failures during deferred component rendering. Info notices keep sequential coalescing, native warning/error records survive display compaction without journal copies, and fatal diagnostic display does not rerun package discovery.
 
 ## [1.2.0] - 2026-10-12
 

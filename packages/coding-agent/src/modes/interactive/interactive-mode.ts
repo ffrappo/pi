@@ -35,8 +35,6 @@ import {
 	type Component,
 	Container,
 	fuzzyFilter,
-	getCapabilities,
-	hyperlink,
 	Markdown,
 	matchesKey,
 	Spacer,
@@ -103,6 +101,7 @@ import {
 	resolveModelScopeFromModels,
 } from "../../core/model-resolver.ts";
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
+import { isNotificationEntry, notificationDisplayEntries, readNotification } from "../../core/notifications.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import { RADIUS_MCP_URL, RADIUS_PROVIDER_ID } from "../../core/radius.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
@@ -497,8 +496,7 @@ export class InteractiveMode {
 
 	// Status line tracking (for mutating immediately-sequential status updates)
 	private lastStatusSpacer: Spacer | undefined = undefined;
-	private lastStatusText: ThemedText | undefined = undefined;
-	private lastStatusMessage = "";
+	private lastStatusText: NotificationMessageComponent | undefined = undefined;
 	private managedToolStatusStarted = false;
 
 	// Streaming message tracking
@@ -1913,29 +1911,22 @@ export class InteractiveMode {
 		}
 
 		if (showDiagnostics) {
-			const skillDiagnostics = skillsResult.diagnostics;
-			if (skillDiagnostics.length > 0) {
+			const addDiagnostics = (title: string, diagnostics: readonly ResourceDiagnostic[]) => {
+				if (diagnostics.length === 0) return;
 				this.loadedResourcesContainer.addChild(
-					new NotificationMessageComponent("Skill conflicts", {
-						level: skillDiagnostics.some((diagnostic) => diagnostic.type === "error") ? "error" : "warning",
-						detail: this.formatDiagnostics(skillDiagnostics, sourceInfos),
+					new NotificationMessageComponent(title, {
+						level: diagnostics.some((diagnostic) => diagnostic.type === "error") ? "error" : "warning",
+						detail: this.formatDiagnostics(diagnostics, sourceInfos),
 						expanded: true,
 					}),
 				);
 				this.loadedResourcesContainer.addChild(new Spacer(1));
-			}
+			};
+			const skillDiagnostics = skillsResult.diagnostics;
+			addDiagnostics("Skill conflicts", skillDiagnostics);
 
 			const promptDiagnostics = promptsResult.diagnostics;
-			if (promptDiagnostics.length > 0) {
-				this.loadedResourcesContainer.addChild(
-					new NotificationMessageComponent("Prompt conflicts", {
-						level: promptDiagnostics.some((diagnostic) => diagnostic.type === "error") ? "error" : "warning",
-						detail: this.formatDiagnostics(promptDiagnostics, sourceInfos),
-						expanded: true,
-					}),
-				);
-				this.loadedResourcesContainer.addChild(new Spacer(1));
-			}
+			addDiagnostics("Prompt conflicts", promptDiagnostics);
 
 			const extensionDiagnostics: ResourceDiagnostic[] = [];
 			const extensionsResult = this.session.resourceLoader.getExtensions();
@@ -1953,28 +1944,10 @@ export class InteractiveMode {
 			const shortcutDiagnostics = this.session.extensionRunner.getShortcutDiagnostics();
 			extensionDiagnostics.push(...shortcutDiagnostics);
 
-			if (extensionDiagnostics.length > 0) {
-				this.loadedResourcesContainer.addChild(
-					new NotificationMessageComponent("Extension issues", {
-						level: extensionDiagnostics.some((diagnostic) => diagnostic.type === "error") ? "error" : "warning",
-						detail: this.formatDiagnostics(extensionDiagnostics, sourceInfos),
-						expanded: true,
-					}),
-				);
-				this.loadedResourcesContainer.addChild(new Spacer(1));
-			}
+			addDiagnostics("Extension issues", extensionDiagnostics);
 
 			const themeDiagnostics = themesResult.diagnostics;
-			if (themeDiagnostics.length > 0) {
-				this.loadedResourcesContainer.addChild(
-					new NotificationMessageComponent("Theme conflicts", {
-						level: themeDiagnostics.some((diagnostic) => diagnostic.type === "error") ? "error" : "warning",
-						detail: this.formatDiagnostics(themeDiagnostics, sourceInfos),
-						expanded: true,
-					}),
-				);
-				this.loadedResourcesContainer.addChild(new Spacer(1));
-			}
+			addDiagnostics("Theme conflicts", themeDiagnostics);
 		}
 	}
 
@@ -2971,9 +2944,7 @@ export class InteractiveMode {
 		} else if (type === "warning") {
 			this.showWarning(message);
 		} else {
-			this.chatContainer.addChild(new Spacer(1));
-			this.chatContainer.addChild(new NotificationMessageComponent(message, { paddingX: this.outputPad }));
-			this.ui.requestRender();
+			this.showStatus(message);
 		}
 	}
 
@@ -3062,7 +3033,7 @@ export class InteractiveMode {
 	 */
 	private showExtensionError(extensionPath: string, error: string, stack?: string): void {
 		const errorMsg = `Extension "${extensionPath}" error: ${error}`;
-		const errorText = new ThemedText(() => theme.fg("error", errorMsg), 1, 0);
+		const errorText = new NotificationMessageComponent(errorMsg, { level: "error", paddingX: this.outputPad });
 		this.chatContainer.addChild(errorText);
 		if (stack) {
 			// Show stack trace in dim color, indented
@@ -3476,7 +3447,7 @@ export class InteractiveMode {
 					);
 					this.ui.requestRender();
 				} else if (event.entry.type === "compaction") {
-					const entries = this.sessionManager.buildContextEntries();
+					const entries = this.notificationSessionEntries();
 					if (entries[0]?.id !== event.entry.id) break;
 					this.chatContainer.clear();
 					const branch = this.sessionManager.getBranch();
@@ -3720,7 +3691,7 @@ export class InteractiveMode {
 						this.showStatus("Auto-compaction cancelled");
 					}
 				} else if (event.result) {
-					const entries = this.sessionManager.buildContextEntries();
+					const entries = this.notificationSessionEntries();
 					if (entries[0]?.type !== "compaction") {
 						throw new Error("Completed compaction is missing from the session context");
 					}
@@ -3747,8 +3718,9 @@ export class InteractiveMode {
 						this.showError(event.errorMessage);
 					} else {
 						this.chatContainer.addChild(new Spacer(1));
-						const errorMessage = event.errorMessage;
-						this.chatContainer.addChild(new ThemedText(() => theme.fg("error", errorMessage), 1, 0));
+						this.chatContainer.addChild(
+							new NotificationMessageComponent(event.errorMessage, { level: "error", paddingX: this.outputPad }),
+						);
 					}
 				}
 				void this.flushCompactionQueue({ willRetry: event.willRetry });
@@ -3834,9 +3806,12 @@ export class InteractiveMode {
 			this.chatContainer.addChild(new Spacer(1));
 			this.managedToolStatusStarted = true;
 		}
-		const message = status.type === "warning" ? `Warning: ${status.message}` : status.message;
-		const color = status.type === "warning" ? "warning" : "dim";
-		this.chatContainer.addChild(new ThemedText(() => theme.fg(color, message), 1, 0));
+		this.chatContainer.addChild(
+			new NotificationMessageComponent(status.message, {
+				level: status.type === "warning" ? "warning" : "info",
+				paddingX: this.outputPad,
+			}),
+		);
 		this.lastStatusSpacer = undefined;
 		this.lastStatusText = undefined;
 		this.ui.requestRender();
@@ -3854,15 +3829,13 @@ export class InteractiveMode {
 		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
 
 		if (last && secondLast && last === this.lastStatusText && secondLast === this.lastStatusSpacer) {
-			this.lastStatusMessage = message;
-			this.lastStatusText.invalidate();
+			this.lastStatusText.setText(message);
 			this.ui.requestRender();
 			return;
 		}
 
 		const spacer = new Spacer(1);
-		this.lastStatusMessage = message;
-		const text = new ThemedText(() => theme.fg("dim", this.lastStatusMessage), 1, 0);
+		const text = new NotificationMessageComponent(message, { paddingX: this.outputPad });
 		this.chatContainer.addChild(spacer);
 		this.chatContainer.addChild(text);
 		this.lastStatusSpacer = spacer;
@@ -3871,7 +3844,12 @@ export class InteractiveMode {
 	}
 
 	private addCustomEntryToChat(entry: Extract<SessionEntry, { type: "custom" }>): void {
-		const renderer = this.session.extensionRunner.getEntryRenderer(entry.customType);
+		const renderer = isNotificationEntry(entry)
+			? (record: typeof entry) => {
+					const data = readNotification(record);
+					return new NotificationMessageComponent(data.text, { level: data.level, paddingX: this.outputPad });
+				}
+			: this.session.extensionRunner.getEntryRenderer(entry.customType);
 		if (!renderer) {
 			return;
 		}
@@ -4154,7 +4132,10 @@ export class InteractiveMode {
 		const label = notice.kind === "compaction" ? "Compaction" : "Branch summary";
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(
-			new ThemedText(() => theme.fg("warning", `${label}: ${formatTokens(tokens)} tokens billed${cost}`), 1, 0),
+			new NotificationMessageComponent(`${label}: ${formatTokens(tokens)} tokens billed${cost}`, {
+				level: "warning",
+				paddingX: this.outputPad,
+			}),
 		);
 	}
 
@@ -4196,11 +4177,10 @@ export class InteractiveMode {
 		const noun = droppedCount === 1 ? "thinking block" : "thinking blocks";
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(
-			new ThemedText(
-				() => theme.fg("warning", `Anthropic dropped ${droppedCount} ${noun} (details in session)`),
-				1,
-				0,
-			),
+			new NotificationMessageComponent(`Anthropic dropped ${droppedCount} ${noun} (details in session)`, {
+				level: "warning",
+				paddingX: this.outputPad,
+			}),
 		);
 	}
 
@@ -4229,11 +4209,17 @@ export class InteractiveMode {
 			label = `Cache miss after ${Math.round(miss.idleMs / 60_000)}m idle`;
 		}
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new ThemedText(() => theme.fg("warning", `${label}: ${reBilled}`), 1, 0));
+		this.chatContainer.addChild(
+			new NotificationMessageComponent(`${label}: ${reBilled}`, { level: "warning", paddingX: this.outputPad }),
+		);
+	}
+
+	private notificationSessionEntries(): SessionEntry[] {
+		return notificationDisplayEntries(this.sessionManager.buildContextEntries(), this.sessionManager.getBranch());
 	}
 
 	renderInitialMessages(): void {
-		const entries = this.sessionManager.buildContextEntries();
+		const entries = this.notificationSessionEntries();
 		this.renderSessionEntries(entries, {
 			updateFooter: true,
 			populateHistory: true,
@@ -4286,7 +4272,7 @@ export class InteractiveMode {
 
 	private rebuildChatFromMessages(): void {
 		this.chatContainer.clear();
-		this.renderSessionEntries(this.sessionManager.buildContextEntries());
+		this.renderSessionEntries(this.notificationSessionEntries());
 	}
 
 	// =========================================================================
@@ -4664,55 +4650,16 @@ export class InteractiveMode {
 	}
 
 	showNewVersionNotification(release: LatestPiRelease): void {
-		const updateInstruction = () =>
-			theme.fg("muted", `New version ${release.version} is available. Run `) +
-			theme.fg("accent", `${APP_NAME} update`);
-		const changelogUrl = "https://pi.dev/changelog";
-		const changelogLine = () => {
-			const changelogLink = getCapabilities().hyperlinks
-				? hyperlink(theme.fg("accent", changelogUrl), changelogUrl)
-				: theme.fg("accent", changelogUrl);
-			return theme.fg("muted", "Changelog: ") + changelogLink;
-		};
-		const note = release.note?.trim();
-
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("warning", text)));
-		this.chatContainer.addChild(
-			new ThemedText(() => `${theme.bold(theme.fg("warning", "Update Available"))}\n${updateInstruction()}`, 1, 0),
-		);
-		if (note) {
-			this.chatContainer.addChild(new Spacer(1));
-			this.chatContainer.addChild(
-				new Markdown(note, 1, 0, this.getMarkdownThemeWithSettings(), {
-					color: (text) => theme.fg("muted", text),
-				}),
-			);
-			this.chatContainer.addChild(new Spacer(1));
-		}
-		this.chatContainer.addChild(new ThemedText(changelogLine, 1, 0));
-		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("warning", text)));
-		this.ui.requestRender();
+		const parts = [
+			`Pi ${release.version} available. Run ${APP_NAME} update.`,
+			release.note?.trim(),
+			"https://pi.dev/changelog",
+		];
+		this.showWarning(parts.filter(Boolean).join("\n"));
 	}
 
 	showPackageUpdateNotification(packages: string[]): void {
-		const updateInstruction = () =>
-			theme.fg("muted", "Package updates are available. Run ") +
-			theme.fg("accent", `${APP_NAME} update --extensions`);
-		const packageLines = packages.map((pkg) => `- ${pkg}`).join("\n");
-
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("warning", text)));
-		this.chatContainer.addChild(
-			new ThemedText(
-				() =>
-					`${theme.bold(theme.fg("warning", "Package Updates Available"))}\n${updateInstruction()}\n${theme.fg("muted", "Packages:")}\n${packageLines}`,
-				1,
-				0,
-			),
-		);
-		this.chatContainer.addChild(new DynamicBorder((text) => theme.fg("warning", text)));
-		this.ui.requestRender();
+		this.showWarning(`Package updates available. Run ${APP_NAME} update --extensions.\n${packages.join("\n")}`);
 	}
 
 	/**

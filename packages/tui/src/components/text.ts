@@ -1,5 +1,5 @@
 import type { Component } from "../tui.ts";
-import { applyBackgroundToLine, flattenLines, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
+import { applyBackgroundToLine, flattenLines, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
 
 /**
  * Text component - displays multi-line text with word wrapping
@@ -78,8 +78,8 @@ export class Text implements Component {
 		const contentLines: string[] = [];
 
 		for (const line of wrappedLines) {
-			// Add margins
-			const lineWithMargins = leftMargin + line + rightMargin;
+			// A single wide grapheme may exceed an extremely narrow content area.
+			const lineWithMargins = leftMargin + truncateToWidth(line, contentWidth, "") + rightMargin;
 
 			// Apply background if specified (this also pads to full width)
 			if (this.customBgFn) {

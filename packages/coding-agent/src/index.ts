@@ -235,6 +235,7 @@ export {
 	ModelRuntime,
 	type ModelRuntimeAuthOverrides,
 } from "./core/model-runtime.ts";
+export { NOTIFICATION_ENTRY } from "./core/notifications.ts";
 export type {
 	PackageManager,
 	PathMetadata,

@@ -16,6 +16,7 @@ import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
 import { type McpServerConfig, McpServerRegistry, mcpNamespace, validateMcpServerConfig } from "../mcp-servers.ts";
+import { NOTIFICATION_ENTRY } from "../notifications.ts";
 import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.ts";
 import { time } from "../timings.ts";
@@ -360,6 +361,8 @@ function createExtensionAPI(
 
 		registerEntryRenderer<T>(customType: string, renderer: EntryRenderer<T>): void {
 			assertActive();
+			if (customType === NOTIFICATION_ENTRY)
+				throw new Error(`${NOTIFICATION_ENTRY} rendering belongs to the Pi host`);
 			extension.entryRenderers ??= new Map();
 			extension.entryRenderers.set(customType, renderer as EntryRenderer);
 		},

@@ -13,6 +13,7 @@ export class CustomEntryComponent extends Container {
 	private entry: CustomEntry<unknown>;
 	private renderer: EntryRenderer;
 	private customComponent?: Component;
+	private rendererError?: string;
 	private _expanded = false;
 	private outputPad: number;
 
@@ -45,19 +46,37 @@ export class CustomEntryComponent extends Container {
 		this.rebuild();
 	}
 
+	override render(width: number): string[] {
+		try {
+			return super.render(width);
+		} catch (error) {
+			if (this.rendererError !== undefined) throw error;
+			this.rendererError = error instanceof Error ? error.message : String(error);
+			this.rebuild();
+			return super.render(width);
+		}
+	}
+
 	private rebuild(): void {
 		this.clear();
 		this.customComponent = undefined;
 
 		let component: Component | undefined;
-		try {
-			component = this.renderer(this.entry, { expanded: this._expanded }, theme);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			component = new NotificationMessageComponent(`[${this.entry.customType}] renderer failed: ${message}`, {
-				level: "error",
-				paddingX: this.outputPad,
-			});
+		if (this.rendererError === undefined) {
+			try {
+				component = this.renderer(this.entry, { expanded: this._expanded }, theme);
+			} catch (error) {
+				this.rendererError = error instanceof Error ? error.message : String(error);
+			}
+		}
+		if (this.rendererError !== undefined) {
+			component = new NotificationMessageComponent(
+				`[${this.entry.customType}] renderer failed: ${this.rendererError}`,
+				{
+					level: "error",
+					paddingX: this.outputPad,
+				},
+			);
 		}
 
 		if (!component) {

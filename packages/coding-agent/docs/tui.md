@@ -32,7 +32,7 @@ After changing component state, invalidate the affected component and call the i
 The package includes components for common layouts and controls:
 
 - `Text`, `Markdown`, `Image`, and `TruncatedText` render content.
-- Pi exports `NotificationMessageComponent` for shared notices. Pass a message and `{ level: "info" | "warning" | "error", detail?, expanded?, paddingX? }`. It owns content only; the caller owns spacing. Its optional third argument is a theme getter for an extension renderer. Native diagnostics and renderer failures use the same component without depending on an extension factory.
+- Pi exports `NotificationMessageComponent` for shared notices. Pass a message and `{ level: "info" | "warning" | "error", detail?, expanded?, paddingX? }`. It owns content only; the caller owns spacing. Its optional third argument is a theme getter for an extension renderer. Native diagnostics and renderer failures use the same component without depending on an extension factory. For durable UI-only notices, append `NOTIFICATION_ENTRY` with `{ text, level }`; the host owns this reserved renderer and retains selected-branch warnings/errors after compaction. Extensions must not register a renderer for it or depend on a sibling extension to render errors. Transient `ctx.ui.notify()` remains native in TUI and RPC; it does not imply durable storage.
 - `Container`, `VStack`, `HStack`, `Box`, and `Spacer` compose layouts.
 - `Input` and `Editor` accept text.
 - `SelectList` and `SettingsList` implement searchable selection and settings flows.

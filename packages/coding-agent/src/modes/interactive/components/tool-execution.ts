@@ -12,13 +12,13 @@ import {
 } from "@earendil-works/pi-tui";
 import type { ToolDefinition, ToolRenderContext, ToolRenderers } from "../../../core/extensions/types.ts";
 
-/** What this component needs from a tool: how to draw it, without executing it. */
 export type { ToolRenderers };
 
 import { formatToolCallWithArgs, getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.ts";
 import { ensurePngTranscoder } from "../../../utils/image-convert.ts";
 import { theme } from "../theme/theme.ts";
 import { keyHint } from "./keybinding-hints.ts";
+import { ToolRendererBoundary } from "./tool-renderer-boundary.ts";
 
 const FALLBACK_PREVIEW_LINES = 10;
 
@@ -37,8 +37,8 @@ export class ToolExecutionComponent extends Container {
 	private callRendererComponent?: Component;
 	private resultRendererComponent?: Component;
 	private rendererState: any = {};
+	private rendererErrors = new Map<"call" | "result", unknown>();
 	private imageComponents: Image[] = [];
-	/** Inputs of imageComponents, so updateDisplay can reuse images and keep their converted PNG data. */
 	private imageSources: Array<{ data: string; mimeType: string; widthCells: number }> = [];
 	private imageSpacers: Spacer[] = [];
 	private toolName: string;
@@ -84,9 +84,6 @@ export class ToolExecutionComponent extends Container {
 
 		this.addChild(new Spacer(1));
 
-		// Always create all shell variants. contentBox is used for default renderer-based composition.
-		// selfRenderContainer is used when the tool renders its own framing.
-		// contentText is reserved for generic fallback rendering when no tool definition exists.
 		this.contentBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
 		this.contentText = new Text("", 1, 1, (text: string) => theme.bg("toolPendingBg", text));
 		this.contentTextRegion = this.createResultRegion(this.contentText);
@@ -99,14 +96,6 @@ export class ToolExecutionComponent extends Container {
 		}
 
 		this.updateDisplay();
-	}
-
-	private getCallRenderer(): ToolDefinition<any, any>["renderCall"] | undefined {
-		return this.toolDefinition?.renderCall;
-	}
-
-	private getResultRenderer(): ToolDefinition<any, any>["renderResult"] | undefined {
-		return this.toolDefinition?.renderResult;
 	}
 
 	private hasRendererDefinition(): boolean {
@@ -284,25 +273,28 @@ export class ToolExecutionComponent extends Container {
 			}
 			renderContainer.clear();
 
-			const callRenderer = this.getCallRenderer();
+			const callRenderer = this.toolDefinition?.renderCall;
 			if (!callRenderer) {
 				renderContainer.addChild(this.createResultRegion(this.createCallFallback()));
 				hasContent = true;
 			} else {
-				try {
-					const component = callRenderer(this.args, theme, this.getRenderContext(this.callRendererComponent));
-					this.callRendererComponent = component;
-					renderContainer.addChild(this.createResultRegion(component));
-					hasContent = true;
-				} catch {
-					this.callRendererComponent = undefined;
-					renderContainer.addChild(this.createResultRegion(this.createCallFallback()));
-					hasContent = true;
-				}
+				const component = new ToolRendererBoundary(
+					`${this.toolName} call`,
+					() => {
+						if (this.rendererErrors.has("call")) throw this.rendererErrors.get("call");
+						const rendered = callRenderer(this.args, theme, this.getRenderContext(this.callRendererComponent));
+						this.callRendererComponent = rendered;
+						return rendered;
+					},
+					() => this.createCallFallback(),
+					(error) => this.rendererErrors.set("call", error),
+				);
+				renderContainer.addChild(this.createResultRegion(component));
+				hasContent = true;
 			}
 
 			if (this.result) {
-				const resultRenderer = this.getResultRenderer();
+				const resultRenderer = this.toolDefinition?.renderResult;
 				if (!resultRenderer) {
 					const component = this.createResultFallback();
 					if (component) {
@@ -310,24 +302,24 @@ export class ToolExecutionComponent extends Container {
 						hasContent = true;
 					}
 				} else {
-					try {
-						const component = resultRenderer(
-							{ content: this.result.content as any, details: this.result.details },
-							{ expanded: this.expanded, isPartial: this.isPartial },
-							theme,
-							this.getRenderContext(this.resultRendererComponent),
-						);
-						this.resultRendererComponent = component;
-						renderContainer.addChild(this.createResultRegion(component));
-						hasContent = true;
-					} catch {
-						this.resultRendererComponent = undefined;
-						const component = this.createResultFallback();
-						if (component) {
-							renderContainer.addChild(this.createResultRegion(component));
-							hasContent = true;
-						}
-					}
+					const component = new ToolRendererBoundary(
+						`${this.toolName} result`,
+						() => {
+							if (this.rendererErrors.has("result")) throw this.rendererErrors.get("result");
+							const rendered = resultRenderer(
+								{ content: this.result!.content as any, details: this.result!.details },
+								{ expanded: this.expanded, isPartial: this.isPartial },
+								theme,
+								this.getRenderContext(this.resultRendererComponent),
+							);
+							this.resultRendererComponent = rendered;
+							return rendered;
+						},
+						() => this.createResultFallback(),
+						(error) => this.rendererErrors.set("result", error),
+					);
+					renderContainer.addChild(this.createResultRegion(component));
+					hasContent = true;
 				}
 			}
 		} else {

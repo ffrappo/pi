@@ -1,7 +1,8 @@
 import { type Component, stripTerminalSequences, Text } from "@earendil-works/pi-tui";
+import type { NotificationLevel } from "../../../core/notifications.ts";
 import { type Theme, theme } from "../theme/theme.ts";
 
-export type NotificationLevel = "info" | "warning" | "error";
+export type { NotificationLevel } from "../../../core/notifications.ts";
 
 export interface NotificationMessageOptions {
 	level?: NotificationLevel;
@@ -19,7 +20,7 @@ function plainText(text: string): string {
 
 /** Shared content for host diagnostics and extension notices. The caller owns spacing. */
 export class NotificationMessageComponent implements Component {
-	private readonly message: string;
+	private message: string;
 	private readonly options: NotificationMessageOptions;
 	private readonly getTheme: () => Theme;
 
@@ -27,6 +28,10 @@ export class NotificationMessageComponent implements Component {
 		this.message = message;
 		this.options = options;
 		this.getTheme = getTheme;
+	}
+
+	setText(message: string): void {
+		this.message = message;
 	}
 
 	render(width: number): string[] {

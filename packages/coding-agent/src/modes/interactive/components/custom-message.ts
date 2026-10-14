@@ -15,6 +15,8 @@ export class CustomMessageComponent extends Container {
 	private customRenderer?: MessageRenderer;
 	private box: Box;
 	private customComponent?: Component;
+	private rendererError?: string;
+	private errorNotice?: NotificationMessageComponent;
 	private markdownTheme: MarkdownTheme;
 	private _expanded = false;
 	private outputPad: number;
@@ -58,6 +60,17 @@ export class CustomMessageComponent extends Container {
 		this.rebuild();
 	}
 
+	override render(width: number): string[] {
+		try {
+			return super.render(width);
+		} catch (error) {
+			if (!this.customComponent) throw error;
+			this.rendererError = error instanceof Error ? error.message : String(error);
+			this.rebuild();
+			return super.render(width);
+		}
+	}
+
 	private rebuild(): void {
 		// Remove previous content component
 		if (this.customComponent) {
@@ -65,9 +78,10 @@ export class CustomMessageComponent extends Container {
 			this.customComponent = undefined;
 		}
 		this.removeChild(this.box);
+		if (this.errorNotice) this.removeChild(this.errorNotice);
 
-		// Try custom renderer first - it handles its own styling
-		if (this.customRenderer) {
+		// A failed renderer stays visibly failed; the original message stays readable.
+		if (this.customRenderer && this.rendererError === undefined) {
 			try {
 				const component = this.customRenderer(
 					this.message,
@@ -81,14 +95,16 @@ export class CustomMessageComponent extends Container {
 					return;
 				}
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				this.customComponent = new NotificationMessageComponent(
-					`[${this.message.customType}] renderer failed: ${message}`,
-					{ level: "error", paddingX: this.outputPad },
-				);
-				this.addChild(this.customComponent);
-				return;
+				this.rendererError = error instanceof Error ? error.message : String(error);
 			}
+		}
+
+		if (this.rendererError !== undefined) {
+			this.errorNotice = new NotificationMessageComponent(
+				`[${this.message.customType}] renderer failed: ${this.rendererError}`,
+				{ level: "error", paddingX: this.outputPad },
+			);
+			this.addChild(this.errorNotice);
 		}
 
 		// Default rendering uses our box
