@@ -4,6 +4,7 @@ import { Box, Container, Markdown, type MarkdownTheme, Spacer, Text } from "@ear
 import type { MessageRenderer } from "../../../core/extensions/types.ts";
 import type { CustomMessage } from "../../../core/messages.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
+import { NotificationMessageComponent } from "./notification-message.ts";
 
 /**
  * Component that renders a custom message entry from extensions.
@@ -79,8 +80,14 @@ export class CustomMessageComponent extends Container {
 					this.addChild(component);
 					return;
 				}
-			} catch {
-				// Fall through to default rendering
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				this.customComponent = new NotificationMessageComponent(
+					`[${this.message.customType}] renderer failed: ${message}`,
+					{ level: "error", paddingX: this.outputPad },
+				);
+				this.addChild(this.customComponent);
+				return;
 			}
 		}
 

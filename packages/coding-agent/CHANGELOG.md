@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Added `NotificationMessageComponent` for shared themed, wrapped notices in the host and extensions.
+
+### Fixed
+
+- Render resource diagnostics, extension notifications and custom-renderer failures through the shared TUI notice component, even when an extension fails to load. Custom-message renderer errors remain visible instead of silently rendering the default message.
+
 ## [1.2.0] - 2026-10-12
 
 ### New Features

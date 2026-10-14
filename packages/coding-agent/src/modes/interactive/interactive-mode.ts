@@ -154,6 +154,7 @@ import { formatKeyText, keyDisplayText, keyHint, keyText, rawKeyHint } from "./c
 import { LoginDialogComponent } from "./components/login-dialog.ts";
 import { createMermaidMarkdownTransformer } from "./components/mermaid.ts";
 import { ModelSelectorComponent } from "./components/model-selector.ts";
+import { NotificationMessageComponent } from "./components/notification-message.ts";
 import {
 	type AuthSelectorProvider,
 	formatAuthSelectorProviderStatus,
@@ -1914,18 +1915,24 @@ export class InteractiveMode {
 		if (showDiagnostics) {
 			const skillDiagnostics = skillsResult.diagnostics;
 			if (skillDiagnostics.length > 0) {
-				const warningLines = () => this.formatDiagnostics(skillDiagnostics, sourceInfos);
 				this.loadedResourcesContainer.addChild(
-					new ThemedText(() => `${theme.fg("warning", "[Skill conflicts]")}\n${warningLines()}`, 0, 0),
+					new NotificationMessageComponent("Skill conflicts", {
+						level: skillDiagnostics.some((diagnostic) => diagnostic.type === "error") ? "error" : "warning",
+						detail: this.formatDiagnostics(skillDiagnostics, sourceInfos),
+						expanded: true,
+					}),
 				);
 				this.loadedResourcesContainer.addChild(new Spacer(1));
 			}
 
 			const promptDiagnostics = promptsResult.diagnostics;
 			if (promptDiagnostics.length > 0) {
-				const warningLines = () => this.formatDiagnostics(promptDiagnostics, sourceInfos);
 				this.loadedResourcesContainer.addChild(
-					new ThemedText(() => `${theme.fg("warning", "[Prompt conflicts]")}\n${warningLines()}`, 0, 0),
+					new NotificationMessageComponent("Prompt conflicts", {
+						level: promptDiagnostics.some((diagnostic) => diagnostic.type === "error") ? "error" : "warning",
+						detail: this.formatDiagnostics(promptDiagnostics, sourceInfos),
+						expanded: true,
+					}),
 				);
 				this.loadedResourcesContainer.addChild(new Spacer(1));
 			}
@@ -1947,18 +1954,24 @@ export class InteractiveMode {
 			extensionDiagnostics.push(...shortcutDiagnostics);
 
 			if (extensionDiagnostics.length > 0) {
-				const warningLines = () => this.formatDiagnostics(extensionDiagnostics, sourceInfos);
 				this.loadedResourcesContainer.addChild(
-					new ThemedText(() => `${theme.fg("warning", "[Extension issues]")}\n${warningLines()}`, 0, 0),
+					new NotificationMessageComponent("Extension issues", {
+						level: extensionDiagnostics.some((diagnostic) => diagnostic.type === "error") ? "error" : "warning",
+						detail: this.formatDiagnostics(extensionDiagnostics, sourceInfos),
+						expanded: true,
+					}),
 				);
 				this.loadedResourcesContainer.addChild(new Spacer(1));
 			}
 
 			const themeDiagnostics = themesResult.diagnostics;
 			if (themeDiagnostics.length > 0) {
-				const warningLines = () => this.formatDiagnostics(themeDiagnostics, sourceInfos);
 				this.loadedResourcesContainer.addChild(
-					new ThemedText(() => `${theme.fg("warning", "[Theme conflicts]")}\n${warningLines()}`, 0, 0),
+					new NotificationMessageComponent("Theme conflicts", {
+						level: themeDiagnostics.some((diagnostic) => diagnostic.type === "error") ? "error" : "warning",
+						detail: this.formatDiagnostics(themeDiagnostics, sourceInfos),
+						expanded: true,
+					}),
 				);
 				this.loadedResourcesContainer.addChild(new Spacer(1));
 			}
@@ -2958,7 +2971,9 @@ export class InteractiveMode {
 		} else if (type === "warning") {
 			this.showWarning(message);
 		} else {
-			this.showStatus(message);
+			this.chatContainer.addChild(new Spacer(1));
+			this.chatContainer.addChild(new NotificationMessageComponent(message, { paddingX: this.outputPad }));
+			this.ui.requestRender();
 		}
 	}
 
@@ -4634,13 +4649,17 @@ export class InteractiveMode {
 
 	showError(errorMessage: string): void {
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new ThemedText(() => theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0));
+		this.chatContainer.addChild(
+			new NotificationMessageComponent(errorMessage, { level: "error", paddingX: this.outputPad }),
+		);
 		this.ui.requestRender();
 	}
 
 	showWarning(warningMessage: string): void {
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new ThemedText(() => theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
+		this.chatContainer.addChild(
+			new NotificationMessageComponent(warningMessage, { level: "warning", paddingX: this.outputPad }),
+		);
 		this.ui.requestRender();
 	}
 
