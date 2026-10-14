@@ -56,7 +56,12 @@ export class CustomMessageComponent extends Container {
 	}
 
 	override invalidate(): void {
-		super.invalidate();
+		try {
+			super.invalidate();
+		} catch (error) {
+			if (!this.customComponent) throw error;
+			this.rendererError = error instanceof Error ? error.message : String(error);
+		}
 		this.rebuild();
 	}
 

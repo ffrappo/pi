@@ -1,5 +1,5 @@
 import type { Component } from "@earendil-works/pi-tui";
-import { Container, Spacer } from "@earendil-works/pi-tui";
+import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import type { EntryRenderer } from "../../../core/extensions/types.ts";
 import type { CustomEntry } from "../../../core/session-manager.ts";
 import { theme } from "../theme/theme.ts";
@@ -42,7 +42,12 @@ export class CustomEntryComponent extends Container {
 	}
 
 	override invalidate(): void {
-		super.invalidate();
+		try {
+			super.invalidate();
+		} catch (error) {
+			if (this.rendererError !== undefined) throw error;
+			this.rendererError = error instanceof Error ? error.message : String(error);
+		}
 		this.rebuild();
 	}
 
@@ -86,5 +91,8 @@ export class CustomEntryComponent extends Container {
 		this.customComponent = component;
 		this.addChild(new Spacer(1));
 		this.addChild(component);
+		if (this.rendererError !== undefined && this._expanded) {
+			this.addChild(new Text(JSON.stringify(this.entry.data, null, 2), this.outputPad, 0));
+		}
 	}
 }

@@ -25,6 +25,15 @@ export class ToolRendererBoundary extends Container {
 		}
 	}
 
+	override invalidate(): void {
+		try {
+			super.invalidate();
+		} catch (error) {
+			if (this.failed) throw error;
+			this.report(error);
+		}
+	}
+
 	override render(width: number): string[] {
 		try {
 			return super.render(width);
